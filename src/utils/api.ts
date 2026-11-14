@@ -277,15 +277,23 @@ export async function apiSaveUserPrefs(prefs: UserPreferences): Promise<void> {
 
 // --- Shared Multi-Device Stream Catalog ---
 
-export async function fetchServerHddStreams(): Promise<Track[]> {
+export async function fetchServerHddStreamsSafe(): Promise<{ ok: boolean; tracks: Track[] }> {
   try {
     const res = await fetch(apiUrl('/api/streams'));
-    if (!res.ok) return [];
+    if (!res.ok) return { ok: false, tracks: [] };
     const data = (await res.json()) as { tracks?: Track[] };
-    return Array.isArray(data.tracks) ? data.tracks.map(hydrateTrackUrls) : [];
+    return {
+      ok: true,
+      tracks: Array.isArray(data.tracks) ? data.tracks.map(hydrateTrackUrls) : [],
+    };
   } catch {
-    return [];
+    return { ok: false, tracks: [] };
   }
+}
+
+export async function fetchServerHddStreams(): Promise<Track[]> {
+  const res = await fetchServerHddStreamsSafe();
+  return res.tracks;
 }
 
 const DEVICE_ID_KEY = 'aura_device_id_v1';

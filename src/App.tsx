@@ -91,7 +91,7 @@ import {
   deleteServerStream,
   fetchAdminStatus,
   fetchConnectedDevices,
-  fetchServerHddStreams,
+  fetchServerHddStreamsSafe,
   getOrCreateDeviceIdentity,
   getServerBaseUrl,
   publishTrackToServerStream,
@@ -202,9 +202,11 @@ export default function App() {
   const [serverConfigVersion, setServerConfigVersion] = useState(0);
 
   const refreshServerStreams = useCallback(async () => {
-    const serverTracks = await fetchServerHddStreams();
-    setServerStreams(serverTracks);
-    setLastSyncAt(Date.now());
+    const res = await fetchServerHddStreamsSafe();
+    if (res.ok) {
+      setServerStreams(res.tracks);
+      setLastSyncAt(Date.now());
+    }
   }, []);
 
   const refreshAdminStatus = useCallback(async () => {
@@ -240,16 +242,23 @@ export default function App() {
 
   // Initial fetch + Real-time SSE sync & nearby device Cast listener
   useEffect(() => {
-    refreshServerStreams();
+    void refreshServerStreams();
     fetchConnectedDevices().then((devices) => {
       setConnectedDevices(devices);
     });
+    let sseRefreshTimer: number | null = null;
     const unsubscribe = subscribeToStreamEvents(
       () => {
-        refreshServerStreams();
-        if (isAdmin) {
-          refreshAdminStatus();
+        if (sseRefreshTimer !== null) {
+          window.clearTimeout(sseRefreshTimer);
         }
+        sseRefreshTimer = window.setTimeout(() => {
+          sseRefreshTimer = null;
+          void refreshServerStreams();
+          if (isAdmin) {
+            void refreshAdminStatus();
+          }
+        }, 300);
       },
       (state, payload) => {
         setSyncState(state);
@@ -276,7 +285,10 @@ export default function App() {
         },
       }
     );
-    return unsubscribe;
+    return () => {
+      if (sseRefreshTimer !== null) window.clearTimeout(sseRefreshTimer);
+      unsubscribe();
+    };
   }, [deviceIdentity, isAdmin, refreshAdminStatus, refreshServerStreams, serverConfigVersion]);
 
   // Refresh admin operational status when entering Admin tab or signing in as Admin
@@ -290,7 +302,7 @@ export default function App() {
     return () => window.clearInterval(interval);
   }, [isAdmin, refreshAdminStatus]);
 
-  // Reload scoped user preferences and device local files when user changes
+  // Reload scoped user preferences and merge device local files when user changes
   useEffect(() => {
     if (!authReady) return;
     let cancelled = false;
@@ -309,7 +321,25 @@ export default function App() {
     }
 
     loadLocalTracksFromDb(ownerKey).then((loaded) => {
-      if (!cancelled) setLocalTracks(loaded);
+      if (cancelled) return;
+      setLocalTracks((prev) => {
+        if (prev.length === 0) return loaded;
+        // Preserve already-synced session tracks when logging in/out instead of wiping them
+        const loadedIds = new Set(loaded.map((t) => t.id));
+        const liveSessionOnly = prev.filter((t) => !loadedIds.has(t.id));
+        const prevById = new Map(prev.map((t) => [t.id, t]));
+        const mergedLoaded = loaded.map((item) => {
+          const existing = prevById.get(item.id);
+          if (existing && existing.url.startsWith('blob:')) {
+            if (item.url.startsWith('blob:') && item.url !== existing.url) {
+              URL.revokeObjectURL(item.url);
+            }
+            return existing;
+          }
+          return item;
+        });
+        return [...liveSessionOnly, ...mergedLoaded];
+      });
     });
 
     loadHddHandlesFromDb(ownerKey).then((handles) => {
@@ -537,6 +567,8 @@ export default function App() {
   const eqFiltersRef = useRef<BiquadFilterNode[]>([]);
   const masterGainRef = useRef<GainNode | null>(null);
   const localSourceConnectedRef = useRef(false);
+  const playRequestIdRef = useRef(0);
+  const inMemoryBlobMapRef = useRef<Map<string, Blob>>(new Map());
 
   // --- Playback State ---
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
@@ -552,13 +584,14 @@ export default function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
 
-  // Keep currentTrack synced if admin edits metadata from another device or modal
+  // Keep currentTrack synced if admin edits metadata or a local track gets a fresh blob URL
   useEffect(() => {
     if (!currentTrack) return;
     const updated = allTracks.find((t) => t.id === currentTrack.id);
     if (
       updated &&
-      (updated.title !== currentTrack.title ||
+      (updated.url !== currentTrack.url ||
+        updated.title !== currentTrack.title ||
         updated.artist !== currentTrack.artist ||
         updated.album !== currentTrack.album ||
         updated.genre !== currentTrack.genre ||
@@ -633,6 +666,17 @@ export default function App() {
     };
   }, [isMuted, prefs.eqBands, prefs.volume]);
 
+  const resumeAudioContextBounded = useCallback(async () => {
+    const graph = ensureAudioGraph();
+    const ctx = graph?.ctx;
+    if (ctx && ctx.state === 'suspended') {
+      await Promise.race([
+        ctx.resume().catch(() => {}),
+        new Promise<void>((resolve) => window.setTimeout(resolve, 250)),
+      ]);
+    }
+  }, [ensureAudioGraph]);
+
   // Sync EQ band gains
   useEffect(() => {
     eqFiltersRef.current.forEach((filter, idx) => {
@@ -683,6 +727,7 @@ export default function App() {
 
   const playTrackLocally = useCallback(
     async (track: Track, startAtSec = 0) => {
+      const reqId = ++playRequestIdRef.current;
       setPlaybackError('');
       setCurrentTrack(track);
       setCurrentTime(startAtSec);
@@ -696,28 +741,88 @@ export default function App() {
       stopAllEngines();
 
       if (isSameOriginTrack(track)) {
-        ensureAudioGraph();
+        await resumeAudioContextBounded();
+        if (playRequestIdRef.current !== reqId) return;
+
         const el = localAudioRef.current;
         if (!el) return;
         setIsBuffering(true);
-        el.src = track.url;
+
+        // Always rebuild blob URL from in-memory or IndexedDB cache if needed
+        let playableUrl = track.url;
+        const memBlob = inMemoryBlobMapRef.current.get(track.id);
+        if (track.source === 'local' && (!playableUrl || !playableUrl.startsWith('blob:')) && memBlob) {
+          playableUrl = URL.createObjectURL(memBlob);
+        }
+
+        if (playableUrl.startsWith('blob:') || playableUrl.startsWith('data:')) {
+          el.removeAttribute('crossorigin');
+        } else {
+          el.crossOrigin = 'anonymous';
+        }
+
+        el.src = playableUrl;
+        el.load();
         el.playbackRate = prefs.playbackRate;
         if (startAtSec > 0 && isFinite(startAtSec)) {
           el.currentTime = startAtSec;
         }
         try {
           await el.play();
+          if (playRequestIdRef.current !== reqId) return;
           setIsPlaying(true);
           setIsBuffering(false);
-        } catch {
+        } catch (playErr) {
+          if (playRequestIdRef.current !== reqId) return;
+          const errName = playErr instanceof DOMException ? playErr.name : '';
+
+          if (errName === 'AbortError') {
+            setIsBuffering(false);
+            return;
+          }
+
+          if (errName === 'NotAllowedError') {
+            setIsPlaying(false);
+            setIsBuffering(false);
+            showStatus(`พร้อมเล่น "${track.title}" — กดปุ่ม Play เพื่อเริ่มฟัง`);
+            return;
+          }
+
           if (track.source === 'local') {
-            const storedBlob = await getLocalBlobFromDb(track.id);
+            const storedBlob = memBlob || (await getLocalBlobFromDb(track.id));
+            if (playRequestIdRef.current !== reqId) return;
+
             if (storedBlob) {
+              // Retry direct fresh blob URL first in case previous blob URL was revoked
+              const freshBlobUrl = URL.createObjectURL(storedBlob);
+              el.removeAttribute('crossorigin');
+              el.src = freshBlobUrl;
+              el.load();
+              try {
+                await el.play();
+                if (playRequestIdRef.current !== reqId) return;
+                setLocalTracks((prev) =>
+                  prev.map((t) => (t.id === track.id ? { ...t, url: freshBlobUrl } : t))
+                );
+                setCurrentTrack((prev) =>
+                  prev && prev.id === track.id ? { ...prev, url: freshBlobUrl } : prev
+                );
+                setIsPlaying(true);
+                setIsBuffering(false);
+                return;
+              } catch {
+                // Continue to PCM WAV fallback
+              }
+
               const wavUrl = await decodeBlobToWavUrl(storedBlob);
+              if (playRequestIdRef.current !== reqId) return;
               if (wavUrl) {
+                el.removeAttribute('crossorigin');
                 el.src = wavUrl;
+                el.load();
                 try {
                   await el.play();
+                  if (playRequestIdRef.current !== reqId) return;
                   setIsPlaying(true);
                   setIsBuffering(false);
                   showStatus(`แปลงไฟล์ ${track.format} ผ่านตัวถอดรหัส PCM สำเร็จ`);
@@ -727,10 +832,31 @@ export default function App() {
                 }
               }
             }
+          } else if (remoteAudioRef.current) {
+            // Fallback to remoteAudioRef (bypasses WebAudio CORS restrictions on cross-origin streams)
+            const fallbackEl = remoteAudioRef.current;
+            fallbackEl.src = playableUrl;
+            fallbackEl.volume = isMuted ? 0 : prefs.volume;
+            fallbackEl.playbackRate = prefs.playbackRate;
+            fallbackEl.load();
+            try {
+              await fallbackEl.play();
+              if (playRequestIdRef.current !== reqId) return;
+              setIsPlaying(true);
+              setIsBuffering(false);
+              return;
+            } catch {
+              // fall through to error banner
+            }
           }
+
           setIsPlaying(false);
           setIsBuffering(false);
-          setPlaybackError(`เบราว์เซอร์นี้ไม่รองรับการถอดรหัส ${track.format} โดยตรง`);
+          setPlaybackError(
+            track.source === 'local'
+              ? `ไม่สามารถเปิดไฟล์ ${track.format} นี้ได้ กรุณากดซิงค์โฟลเดอร์ใหม่อีกครั้ง`
+              : `ไม่สามารถโหลดเสียง "${track.title}" จากเซิร์ฟเวอร์ได้`
+          );
         }
         return;
       }
@@ -742,25 +868,39 @@ export default function App() {
       remoteEl.src = track.url;
       remoteEl.volume = isMuted ? 0 : prefs.volume;
       remoteEl.playbackRate = prefs.playbackRate;
+      remoteEl.load();
       if (startAtSec > 0 && isFinite(startAtSec)) {
         remoteEl.currentTime = startAtSec;
       }
       try {
         await remoteEl.play();
+        if (playRequestIdRef.current !== reqId) return;
         setIsPlaying(true);
         setIsBuffering(false);
-      } catch {
+      } catch (err) {
+        if (playRequestIdRef.current !== reqId) return;
+        const errName = err instanceof DOMException ? err.name : '';
+        if (errName === 'AbortError') {
+          setIsBuffering(false);
+          return;
+        }
+        if (errName === 'NotAllowedError') {
+          setIsPlaying(false);
+          setIsBuffering(false);
+          showStatus(`พร้อมเล่น "${track.title}" — กดปุ่ม Play เพื่อเริ่มฟัง`);
+          return;
+        }
         setIsPlaying(false);
         setIsBuffering(false);
         setPlaybackError('ไม่สามารถเชื่อมต่อสตรีมจากลิงก์ภายนอกนี้ได้');
       }
     },
     [
-      ensureAudioGraph,
       isMuted,
       isSameOriginTrack,
       prefs.playbackRate,
       prefs.volume,
+      resumeAudioContextBounded,
       showStatus,
       stopAllEngines,
       updatePrefs,
@@ -1058,19 +1198,20 @@ export default function App() {
     const activeEl = usesLocalEl ? localAudioRef.current : remoteAudioRef.current;
     if (!activeEl) return;
 
-    if (!activeEl.src) {
+    if (!activeEl.src || activeEl.error || activeEl.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) {
       await playTrack(currentTrack);
       return;
     }
 
     if (activeEl.paused) {
-      if (usesLocalEl) ensureAudioGraph();
+      if (usesLocalEl) await resumeAudioContextBounded();
       try {
         await activeEl.play();
         setIsPlaying(true);
         setPlaybackError('');
       } catch {
-        setPlaybackError('ไม่สามารถเล่นแทร็กนี้ได้');
+        // Reload track cleanly if cached audio element failed
+        await playTrackLocally(currentTrack, activeEl.currentTime || 0);
       }
     } else {
       activeEl.pause();
@@ -1080,11 +1221,12 @@ export default function App() {
     activeCastTarget,
     currentTrack,
     displayedTracks,
-    ensureAudioGraph,
     handleRemoteCastAction,
     isPlaying,
     isSameOriginTrack,
     playTrack,
+    playTrackLocally,
+    resumeAudioContextBounded,
   ]);
 
   const activeQueue = displayedTracks.length > 0 ? displayedTracks : allTracks;
@@ -1264,41 +1406,48 @@ export default function App() {
           const batch = audioEntries.slice(i, i + BATCH_SIZE);
           const parsedBatch = await Promise.all(
             batch.map(async ({ file, relativePath }) => {
-              const relPath =
-                relativePath ||
-                ((file as File & { webkitRelativePath?: string }).webkitRelativePath || '').trim() ||
-                file.name;
-              const deterministicSeed = hashStringToSeed(
-                `${ownerKey}:${relPath}:${file.size}:${file.lastModified}`
-              );
-              const candidateId = `local-${deterministicSeed.toString(36)}-${file.size.toString(36)}`;
-              const cached = existingById.get(candidateId);
+              try {
+                const relPath =
+                  relativePath ||
+                  ((file as File & { webkitRelativePath?: string }).webkitRelativePath || '').trim() ||
+                  file.name;
+                const deterministicSeed = hashStringToSeed(
+                  `${ownerKey}:${relPath}:${file.size}:${file.lastModified}`
+                );
+                const candidateId = `local-${deterministicSeed.toString(36)}-${file.size.toString(36)}`;
+                const cached = existingById.get(candidateId);
 
-              let track: Track;
-              if (cached) {
-                const syncedFolder = inferredFolder || cached.syncedFolder;
-                track = {
-                  ...cached,
-                  url: URL.createObjectURL(file),
-                  addedAt: Date.now(),
-                  relativePath: relPath,
-                  syncedFolder,
-                  folderName:
-                    cached.folderName || extractFolderNameFromRelativePath(relPath, syncedFolder),
-                };
-              } else {
-                track = await extractLocalTrack(file, ownerKey, {
-                  relativePath: relPath,
-                  syncedFolder: inferredFolder,
-                  fastMode,
-                });
+                let track: Track;
+                if (cached) {
+                  const syncedFolder = inferredFolder || cached.syncedFolder;
+                  track = {
+                    ...cached,
+                    url: URL.createObjectURL(file),
+                    addedAt: Date.now(),
+                    relativePath: relPath,
+                    syncedFolder,
+                    folderName:
+                      cached.folderName || extractFolderNameFromRelativePath(relPath, syncedFolder),
+                  };
+                } else {
+                  track = await extractLocalTrack(file, ownerKey, {
+                    relativePath: relPath,
+                    syncedFolder: inferredFolder,
+                    fastMode,
+                  });
+                }
+
+                inMemoryBlobMapRef.current.set(track.id, file);
+                dbQueue.push({ track, blob: file });
+                return track;
+              } catch {
+                return null;
               }
-
-              dbQueue.push({ track, blob: file });
-              return track;
             })
           );
-          syncedTracks.push(...parsedBatch);
+          for (const item of parsedBatch) {
+            if (item) syncedTracks.push(item);
+          }
           setHddSyncProgress({
             label: inferredFolder
               ? `กำลังซิงค์โฟลเดอร์ "${inferredFolder}"`
@@ -1313,15 +1462,27 @@ export default function App() {
       }
 
       if (syncedTracks.length > 0) {
+        const urlsToRevoke: string[] = [];
         setLocalTracks((prev) => {
           const incomingIds = new Set(syncedTracks.map((t) => t.id));
           const preserved = prev.filter((t) => {
             if (!incomingIds.has(t.id)) return true;
-            if (t.url.startsWith('blob:')) URL.revokeObjectURL(t.url);
+            if (t.url.startsWith('blob:')) urlsToRevoke.push(t.url);
             return false;
           });
           return [...syncedTracks, ...preserved];
         });
+
+        // Delay revoking replaced blob URLs so active audio element transitions smoothly
+        if (urlsToRevoke.length > 0) {
+          window.setTimeout(() => {
+            for (const oldUrl of urlsToRevoke) {
+              if (localAudioRef.current?.src !== oldUrl) {
+                URL.revokeObjectURL(oldUrl);
+              }
+            }
+          }, 8000);
+        }
 
         if (inferredFolder) {
           const updatedFolders = saveSyncedFolderSummary(ownerKey, {
@@ -1337,9 +1498,10 @@ export default function App() {
           updatePrefs((prev) => ({ ...prev, includeHddInStream: true }));
         }
 
-        const nextTab = options?.targetTab ?? (activeTab === 'admin' ? 'local' : activeTab);
-        if (activeTab === 'admin' || options?.targetTab) {
-          setActiveTab(nextTab);
+        if (activeTab === 'admin') {
+          setActiveTab('local');
+        } else if (options?.targetTab && activeTab !== 'all') {
+          setActiveTab(options.targetTab);
         }
 
         const shouldAutoPublish = isAdmin && prefs.autoStreamOnAdd !== false;
@@ -1348,17 +1510,17 @@ export default function App() {
             ? `ซิงค์โฟลเดอร์ "${inferredFolder}" สำเร็จ ${syncedTracks.length} เพลง — กำลังสตรีมออนไลน์ทันที`
             : `เพิ่มเพลงจาก HDD ${syncedTracks.length} เพลง — กำลังสตรีมออนไลน์ทันที`
         );
-        playTrack(syncedTracks[0]);
+        void playTrack(syncedTracks[0]);
 
-        // Persist eligible small caches asynchronously in background without blocking sync UI
+        // Persist eligible caches asynchronously in background without blocking sync UI
         void saveLocalTracksBatchToDb(dbQueue);
 
-        // If Admin & autoStreamOnAdd enabled, auto-publish new tracks to shared online stream for all devices
+        // If Admin & autoStreamOnAdd enabled, auto-publish new tracks sequentially so server is never overloaded
         if (shouldAutoPublish) {
           const existingServerKeys = new Set(
             serverStreams.map((t) => `${t.title.toLowerCase()}::${t.sizeBytes || 0}`)
           );
-          const MAX_AUTO_PUBLISH_BYTES = 240 * 1024 * 1024;
+          const MAX_AUTO_PUBLISH_BYTES = 80 * 1024 * 1024;
           const toPublish = dbQueue.filter(({ track, blob }) => {
             if (blob.size <= 0 || blob.size > MAX_AUTO_PUBLISH_BYTES) return false;
             const key = `${track.title.toLowerCase()}::${track.sizeBytes || 0}`;
@@ -1375,28 +1537,20 @@ export default function App() {
                 updatedAt: Date.now(),
               });
 
-              const PUBLISH_BATCH = 2;
-              for (let i = 0; i < toPublish.length; i += PUBLISH_BATCH) {
-                const slice = toPublish.slice(i, i + PUBLISH_BATCH);
-                await Promise.all(
-                  slice.map(async ({ track, blob }) => {
-                    try {
-                      const fname =
-                        blob instanceof File ? blob.name : `${track.title}.${track.format.toLowerCase()}`;
-                      const created = await publishTrackToServerStream(track, blob, fname);
-                      publishedMap.set(track.id, created.id);
-                      publishedCount++;
-                    } catch {
-                      // skip individual publish error
-                    }
-                  })
-                );
+              for (let i = 0; i < toPublish.length; i++) {
+                const { track, blob } = toPublish[i];
+                try {
+                  const fname =
+                    blob instanceof File ? blob.name : `${track.title}.${track.format.toLowerCase()}`;
+                  const created = await publishTrackToServerStream(track, blob, fname);
+                  publishedMap.set(track.id, created.id);
+                  publishedCount++;
+                } catch {
+                  // skip individual publish error
+                }
                 setAdminTask({
                   state: 'working',
-                  message: `กำลังเปิดสตรีมออนไลน์อัตโนมัติทุกเครื่อง (${Math.min(
-                    i + slice.length,
-                    toPublish.length
-                  )}/${toPublish.length})...`,
+                  message: `กำลังเปิดสตรีมออนไลน์อัตโนมัติทุกเครื่อง (${i + 1}/${toPublish.length})...`,
                   updatedAt: Date.now(),
                 });
               }
@@ -1446,9 +1600,9 @@ export default function App() {
   );
 
   const processIncomingFiles = useCallback(
-    async (fileList: FileList | null) => {
-      if (!fileList || fileList.length === 0) return;
-      const items = Array.from(fileList).map((file) => ({
+    async (files: File[]) => {
+      if (files.length === 0) return;
+      const items = files.map((file) => ({
         file,
         relativePath:
           ((file as File & { webkitRelativePath?: string }).webkitRelativePath || '').trim() ||
@@ -1463,8 +1617,11 @@ export default function App() {
   );
 
   const handleFileInputChange = (e: ChangeEvent<HTMLInputElement>) => {
-    processIncomingFiles(e.target.files);
+    const files = e.target.files ? Array.from(e.target.files) : [];
     e.target.value = '';
+    if (files.length > 0) {
+      void processIncomingFiles(files);
+    }
   };
 
   const handleDrop = async (e: DragEvent<HTMLDivElement>) => {
@@ -1521,12 +1678,20 @@ export default function App() {
       for (let i = 0; i < pendingHandles.length; i += GET_FILE_BATCH) {
         const chunk = pendingHandles.slice(i, i + GET_FILE_BATCH);
         const resolved = await Promise.all(
-          chunk.map(async ({ handle, relativePath }) => ({
-            file: await handle.getFile(),
-            relativePath,
-          }))
+          chunk.map(async ({ handle, relativePath }) => {
+            try {
+              return {
+                file: await handle.getFile(),
+                relativePath,
+              };
+            } catch {
+              return null;
+            }
+          })
         );
-        files.push(...resolved);
+        for (const item of resolved) {
+          if (item) files.push(item);
+        }
       }
       return files;
     },
@@ -1567,8 +1732,12 @@ export default function App() {
       })
       .catch((err) => {
         if (err instanceof DOMException && err.name === 'AbortError') return;
+        if (err instanceof DOMException && err.name === 'SecurityError') {
+          folderInputRef.current?.click();
+          return;
+        }
         showStatus(
-          'เบราว์เซอร์บล็อกหน้าต่างเลือกโฟลเดอร์อัตโนมัติ — กรุณากด "เปิดทั้งโฟลเดอร์ (ไม่อัปโหลด)" เพื่อซิงค์จาก HDD'
+          'ไม่สามารถเปิดหน้าต่างเลือกโฟลเดอร์ได้ — กรุณากด "เลือกไฟล์จาก HDD เครื่องนี้" หรือวางโฟลเดอร์ลงในหน้าจอ'
         );
       });
   }, [activeTab, collectAudioFilesFromDirHandle, ownerKey, showStatus, syncFilesIntoLibrary]);
@@ -1681,7 +1850,8 @@ export default function App() {
           setIsPlaying(false);
           setCurrentTrack(null);
         }
-        URL.revokeObjectURL(track.url);
+        if (track.url.startsWith('blob:')) URL.revokeObjectURL(track.url);
+        inMemoryBlobMapRef.current.delete(track.id);
         await deleteLocalTrackFromDb(track.id);
         setLocalTracks((prev) => prev.filter((t) => t.id !== track.id));
         showStatus(`ลบไฟล์ "${track.title}" ออกจากเครื่องนี้แล้ว`);
@@ -1896,6 +2066,7 @@ export default function App() {
     for (const t of localTracks) {
       if (t.url.startsWith('blob:')) URL.revokeObjectURL(t.url);
     }
+    inMemoryBlobMapRef.current.clear();
     await clearLocalTracksFromDb(ownerKey);
     clearSyncedFolderSummaries(ownerKey);
     setLocalTracks([]);
@@ -1920,6 +2091,7 @@ export default function App() {
     for (const t of localTracks) {
       if (t.url.startsWith('blob:')) URL.revokeObjectURL(t.url);
     }
+    inMemoryBlobMapRef.current.clear();
 
     await Promise.all([clearLocalTracksFromDb(ownerKey), clearHddHandlesFromDb(ownerKey)]);
     clearSyncedFolderSummaries(ownerKey);
@@ -2038,7 +2210,6 @@ export default function App() {
       {/* Dual Audio Elements */}
       <audio
         ref={localAudioRef}
-        crossOrigin="anonymous"
         onLoadedMetadata={(e) => {
           const el = e.currentTarget;
           if (isFinite(el.duration) && el.duration > 0) {

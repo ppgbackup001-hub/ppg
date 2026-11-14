@@ -534,7 +534,19 @@ async function scanAudioDirectory(
       if (entry.name.startsWith('.')) continue;
       const fullPath = path.join(current, entry.name);
 
-      if (entry.isDirectory()) {
+      let isDir = entry.isDirectory();
+      let isFile = entry.isFile();
+      if (!isDir && !isFile && entry.isSymbolicLink()) {
+        try {
+          const st = await fsp.stat(fullPath);
+          isDir = st.isDirectory();
+          isFile = st.isFile();
+        } catch {
+          continue;
+        }
+      }
+
+      if (isDir) {
         if (
           entry.name !== 'node_modules' &&
           entry.name !== '.git' &&
@@ -546,7 +558,7 @@ async function scanAudioDirectory(
         continue;
       }
 
-      if (!entry.isFile()) continue;
+      if (!isFile) continue;
       const ext = path.extname(entry.name).toLowerCase();
       if (AUDIO_EXTENSIONS.has(ext)) {
         audioPaths.push(fullPath);
@@ -1609,7 +1621,11 @@ async function startServer(): Promise<void> {
 
     const rescannedAll: StoredStreamTrack[] = [...standaloneFiles];
     for (const folder of mountedFolders) {
-      if (!fs.existsSync(folder)) continue;
+      if (!fs.existsSync(folder)) {
+        // Keep previously indexed entries for temporarily unavailable folders instead of wiping them
+        rescannedAll.push(...existing.filter((item) => item.sourceFolder === folder));
+        continue;
+      }
       const scanned = await scanAudioDirectory(folder, 'user-admin', 2000, cachedByPath);
       rescannedAll.push(...scanned);
     }

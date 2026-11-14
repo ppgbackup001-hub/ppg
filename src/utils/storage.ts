@@ -242,8 +242,8 @@ export function removeSyncedFolderSummary(ownerId: string, id: string): SyncedHd
   return next;
 }
 
-const MAX_IDB_BLOB_BYTES = 18 * 1024 * 1024;
-const MAX_IDB_BATCH_TOTAL_BYTES = 150 * 1024 * 1024;
+const MAX_IDB_BLOB_BYTES = 80 * 1024 * 1024;
+const MAX_IDB_BATCH_TOTAL_BYTES = 600 * 1024 * 1024;
 
 export async function saveLocalTrackToDb(track: Track, blob: Blob): Promise<void> {
   if (blob.size > MAX_IDB_BLOB_BYTES) {
@@ -286,10 +286,8 @@ export async function saveLocalTracksBatchToDb(
     });
     if (eligible.length === 0) return;
 
-    const CHUNK = 25;
-    for (let i = 0; i < eligible.length; i += CHUNK) {
-      const slice = eligible.slice(i, i + CHUNK);
-      await new Promise<void>((resolve, reject) => {
+    const putChunk = (slice: Array<{ track: Track; blob: Blob }>) =>
+      new Promise<void>((resolve, reject) => {
         const tx = db!.transaction(IDB_STORE, 'readwrite');
         const store = tx.objectStore(IDB_STORE);
         for (const { track, blob } of slice) {
@@ -305,6 +303,23 @@ export async function saveLocalTracksBatchToDb(
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
       });
+
+    const CHUNK = 15;
+    for (let i = 0; i < eligible.length; i += CHUNK) {
+      const slice = eligible.slice(i, i + CHUNK);
+      try {
+        await putChunk(slice);
+      } catch {
+        // Fallback: save individually so one oversized/corrupt item never drops the rest
+        for (const single of slice) {
+          try {
+            await putChunk([single]);
+          } catch {
+            // Stop further writes if browser storage quota is full
+            return;
+          }
+        }
+      }
     }
   } catch {
     // Non-fatal: tracks play directly from HDD objectURL in current session
