@@ -562,6 +562,7 @@ export default function App() {
   // --- Audio Engine Refs ---
   const localAudioRef = useRef<HTMLAudioElement | null>(null);
   const remoteAudioRef = useRef<HTMLAudioElement | null>(null);
+  const activeEngineRef = useRef<'local' | 'remote'>('local');
   const audioCtxRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const eqFiltersRef = useRef<BiquadFilterNode[]>([]);
@@ -569,6 +570,15 @@ export default function App() {
   const localSourceConnectedRef = useRef(false);
   const playRequestIdRef = useRef(0);
   const inMemoryBlobMapRef = useRef<Map<string, Blob>>(new Map());
+  const playbackRetryCountRef = useRef(0);
+  const retryTimerRef = useRef<number | null>(null);
+  const stallTimerRef = useRef<number | null>(null);
+  const intentionalPauseRef = useRef(false);
+  const lastPlaybackTimeRef = useRef(0);
+  const currentTrackRef = useRef<Track | null>(null);
+  const isPlayingRef = useRef(false);
+  const activeCastTargetRef = useRef<ConnectedCastDevice | null>(null);
+  const attemptRecoveryRef = useRef<(reason: 'error' | 'stalled') => void>(() => {});
 
   // --- Playback State ---
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
@@ -583,6 +593,33 @@ export default function App() {
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const folderInputRef = useRef<HTMLInputElement | null>(null);
+
+  useEffect(() => {
+    currentTrackRef.current = currentTrack;
+  }, [currentTrack]);
+
+  useEffect(() => {
+    isPlayingRef.current = isPlaying;
+  }, [isPlaying]);
+
+  useEffect(() => {
+    activeCastTargetRef.current = activeCastTarget;
+  }, [activeCastTarget]);
+
+  const getActiveAudioElement = useCallback((): HTMLAudioElement | null => {
+    return activeEngineRef.current === 'local' ? localAudioRef.current : remoteAudioRef.current;
+  }, []);
+
+  const clearPlaybackTimers = useCallback(() => {
+    if (retryTimerRef.current !== null) {
+      window.clearTimeout(retryTimerRef.current);
+      retryTimerRef.current = null;
+    }
+    if (stallTimerRef.current !== null) {
+      window.clearTimeout(stallTimerRef.current);
+      stallTimerRef.current = null;
+    }
+  }, []);
 
   // Keep currentTrack synced if admin edits metadata or a local track gets a fresh blob URL
   useEffect(() => {
@@ -638,9 +675,15 @@ export default function App() {
       analyserRef.current = analyser;
       eqFiltersRef.current = filters;
       masterGainRef.current = masterGain;
+
+      ctx.onstatechange = () => {
+        if (isPlayingRef.current && ctx.state !== 'running') {
+          ctx.resume().catch(() => {});
+        }
+      };
     }
 
-    if (audioCtxRef.current.state === 'suspended') {
+    if (audioCtxRef.current.state !== 'running') {
       audioCtxRef.current.resume().catch(() => {});
     }
 
@@ -669,13 +712,38 @@ export default function App() {
   const resumeAudioContextBounded = useCallback(async () => {
     const graph = ensureAudioGraph();
     const ctx = graph?.ctx;
-    if (ctx && ctx.state === 'suspended') {
+    if (ctx && ctx.state !== 'running') {
       await Promise.race([
         ctx.resume().catch(() => {}),
         new Promise<void>((resolve) => window.setTimeout(resolve, 250)),
       ]);
     }
   }, [ensureAudioGraph]);
+
+  // Keep AudioContext & active playback alive when tab/app returns to foreground or network reconnects
+  useEffect(() => {
+    const handleKeepAlive = () => {
+      if (!isPlayingRef.current || activeCastTargetRef.current) return;
+      if (audioCtxRef.current && audioCtxRef.current.state !== 'running') {
+        audioCtxRef.current.resume().catch(() => {});
+      }
+      const el = getActiveAudioElement();
+      if (el && el.paused && !el.ended && !intentionalPauseRef.current) {
+        el.play().catch(() => {
+          attemptRecoveryRef.current('error');
+        });
+      }
+    };
+
+    document.addEventListener('visibilitychange', handleKeepAlive);
+    window.addEventListener('focus', handleKeepAlive);
+    window.addEventListener('online', handleKeepAlive);
+    return () => {
+      document.removeEventListener('visibilitychange', handleKeepAlive);
+      window.removeEventListener('focus', handleKeepAlive);
+      window.removeEventListener('online', handleKeepAlive);
+    };
+  }, [getActiveAudioElement]);
 
   // Sync EQ band gains
   useEffect(() => {
@@ -710,9 +778,11 @@ export default function App() {
   }, [prefs.playbackRate]);
 
   const stopAllEngines = useCallback(() => {
+    intentionalPauseRef.current = true;
+    clearPlaybackTimers();
     if (localAudioRef.current) localAudioRef.current.pause();
     if (remoteAudioRef.current) remoteAudioRef.current.pause();
-  }, []);
+  }, [clearPlaybackTimers]);
 
   const isSameOriginTrack = useCallback((track: Track | null) => {
     if (!track) return false;
@@ -725,12 +795,46 @@ export default function App() {
     );
   }, []);
 
+  const seekAudioWhenReady = useCallback((el: HTMLAudioElement, startAtSec: number) => {
+    if (!startAtSec || !isFinite(startAtSec) || startAtSec <= 0) return;
+    const applySeek = () => {
+      try {
+        const maxSafe =
+          isFinite(el.duration) && el.duration > 1 ? Math.max(0, el.duration - 0.5) : startAtSec;
+        el.currentTime = Math.min(startAtSec, maxSafe);
+      } catch {
+        // ignore seek before ready
+      }
+    };
+    if (el.readyState >= 1) {
+      applySeek();
+    } else {
+      el.addEventListener('loadedmetadata', applySeek, { once: true });
+    }
+  }, []);
+
+  const appendCacheBust = useCallback((url: string): string => {
+    if (!url || url.startsWith('blob:') || url.startsWith('data:')) return url;
+    const sep = url.includes('?') ? '&' : '?';
+    return `${url}${sep}_r=${Date.now()}`;
+  }, []);
+
   const playTrackLocally = useCallback(
-    async (track: Track, startAtSec = 0) => {
+    async (
+      track: Track,
+      startAtSec = 0,
+      options?: { forceRemoteEngine?: boolean; cacheBust?: boolean; resetRetry?: boolean }
+    ) => {
       const reqId = ++playRequestIdRef.current;
+      if (options?.resetRetry !== false) {
+        playbackRetryCountRef.current = 0;
+      }
+
       setPlaybackError('');
       setCurrentTrack(track);
+      currentTrackRef.current = track;
       setCurrentTime(startAtSec);
+      lastPlaybackTimeRef.current = startAtSec;
       setDuration(track.durationSec || 0);
 
       updatePrefs((prev) => ({
@@ -739,8 +843,12 @@ export default function App() {
       }));
 
       stopAllEngines();
+      intentionalPauseRef.current = false;
 
-      if (isSameOriginTrack(track)) {
+      const useLocalEngine = !options?.forceRemoteEngine && isSameOriginTrack(track);
+
+      if (useLocalEngine) {
+        activeEngineRef.current = 'local';
         await resumeAudioContextBounded();
         if (playRequestIdRef.current !== reqId) return;
 
@@ -753,6 +861,8 @@ export default function App() {
         const memBlob = inMemoryBlobMapRef.current.get(track.id);
         if (track.source === 'local' && (!playableUrl || !playableUrl.startsWith('blob:')) && memBlob) {
           playableUrl = URL.createObjectURL(memBlob);
+        } else if (options?.cacheBust) {
+          playableUrl = appendCacheBust(playableUrl);
         }
 
         if (playableUrl.startsWith('blob:') || playableUrl.startsWith('data:')) {
@@ -764,9 +874,8 @@ export default function App() {
         el.src = playableUrl;
         el.load();
         el.playbackRate = prefs.playbackRate;
-        if (startAtSec > 0 && isFinite(startAtSec)) {
-          el.currentTime = startAtSec;
-        }
+        seekAudioWhenReady(el, startAtSec);
+
         try {
           await el.play();
           if (playRequestIdRef.current !== reqId) return;
@@ -793,11 +902,11 @@ export default function App() {
             if (playRequestIdRef.current !== reqId) return;
 
             if (storedBlob) {
-              // Retry direct fresh blob URL first in case previous blob URL was revoked
               const freshBlobUrl = URL.createObjectURL(storedBlob);
               el.removeAttribute('crossorigin');
               el.src = freshBlobUrl;
               el.load();
+              seekAudioWhenReady(el, startAtSec);
               try {
                 await el.play();
                 if (playRequestIdRef.current !== reqId) return;
@@ -820,6 +929,7 @@ export default function App() {
                 el.removeAttribute('crossorigin');
                 el.src = wavUrl;
                 el.load();
+                seekAudioWhenReady(el, startAtSec);
                 try {
                   await el.play();
                   if (playRequestIdRef.current !== reqId) return;
@@ -834,11 +944,14 @@ export default function App() {
             }
           } else if (remoteAudioRef.current) {
             // Fallback to remoteAudioRef (bypasses WebAudio CORS restrictions on cross-origin streams)
+            activeEngineRef.current = 'remote';
             const fallbackEl = remoteAudioRef.current;
-            fallbackEl.src = playableUrl;
+            fallbackEl.src = options?.cacheBust ? appendCacheBust(playableUrl) : playableUrl;
             fallbackEl.volume = isMuted ? 0 : prefs.volume;
+            fallbackEl.muted = isMuted;
             fallbackEl.playbackRate = prefs.playbackRate;
             fallbackEl.load();
+            seekAudioWhenReady(fallbackEl, startAtSec);
             try {
               await fallbackEl.play();
               if (playRequestIdRef.current !== reqId) return;
@@ -861,17 +974,17 @@ export default function App() {
         return;
       }
 
-      // External HTTP/Icecast Stream
+      // Remote / Cross-Origin / Direct Stream Element
+      activeEngineRef.current = 'remote';
       const remoteEl = remoteAudioRef.current;
       if (!remoteEl) return;
       setIsBuffering(true);
-      remoteEl.src = track.url;
+      remoteEl.src = options?.cacheBust ? appendCacheBust(track.url) : track.url;
       remoteEl.volume = isMuted ? 0 : prefs.volume;
+      remoteEl.muted = isMuted;
       remoteEl.playbackRate = prefs.playbackRate;
       remoteEl.load();
-      if (startAtSec > 0 && isFinite(startAtSec)) {
-        remoteEl.currentTime = startAtSec;
-      }
+      seekAudioWhenReady(remoteEl, startAtSec);
       try {
         await remoteEl.play();
         if (playRequestIdRef.current !== reqId) return;
@@ -892,20 +1005,70 @@ export default function App() {
         }
         setIsPlaying(false);
         setIsBuffering(false);
-        setPlaybackError('ไม่สามารถเชื่อมต่อสตรีมจากลิงก์ภายนอกนี้ได้');
+        setPlaybackError('ไม่สามารถเชื่อมต่อสตรีมจากลิงก์นี้ได้');
       }
     },
     [
+      appendCacheBust,
       isMuted,
       isSameOriginTrack,
       prefs.playbackRate,
       prefs.volume,
       resumeAudioContextBounded,
+      seekAudioWhenReady,
       showStatus,
       stopAllEngines,
       updatePrefs,
     ]
   );
+
+  // Automatic recovery when active audio stream drops or stalls mid-playback
+  useEffect(() => {
+    attemptRecoveryRef.current = (reason: 'error' | 'stalled') => {
+      const track = currentTrackRef.current;
+      if (!track || activeCastTargetRef.current || intentionalPauseRef.current) return;
+
+      const el = getActiveAudioElement();
+      if (el?.ended) return;
+
+      const attempt = playbackRetryCountRef.current + 1;
+      if (attempt > 3) {
+        setIsBuffering(false);
+        setIsPlaying(false);
+        setPlaybackError(
+          reason === 'stalled'
+            ? `การเชื่อมต่อเสียง "${track.title}" ขาดหาย — กด Play เพื่อเชื่อมต่อใหม่`
+            : track.source === 'local'
+            ? `ไฟล์เสียง "${track.title}" หลุดการเชื่อมต่อ กรุณากดเล่นอีกครั้ง`
+            : `สตรีม "${track.title}" ขาดการเชื่อมต่อชั่วคราว — กด Play เพื่อลองใหม่`
+        );
+        return;
+      }
+
+      playbackRetryCountRef.current = attempt;
+      const resumePos = Math.max(lastPlaybackTimeRef.current || 0, el?.currentTime || 0);
+      const reqSnapshot = playRequestIdRef.current;
+
+      setIsBuffering(true);
+      showStatus(`กำลังเชื่อมต่อเสียง "${track.title}" ใหม่อัตโนมัติ (${attempt}/3)...`);
+
+      if (retryTimerRef.current !== null) {
+        window.clearTimeout(retryTimerRef.current);
+      }
+      retryTimerRef.current = window.setTimeout(() => {
+        retryTimerRef.current = null;
+        if (playRequestIdRef.current !== reqSnapshot || intentionalPauseRef.current) return;
+        const useFallbackRemote =
+          track.source === 'stream' &&
+          (activeEngineRef.current === 'remote' || attempt >= 2 || reason === 'error');
+        void playTrackLocally(track, resumePos, {
+          forceRemoteEngine: useFallbackRemote,
+          cacheBust: track.source === 'stream',
+          resetRetry: false,
+        });
+      }, 650 * attempt);
+    };
+  }, [getActiveAudioElement, playTrackLocally, showStatus]);
 
   const ensureShareableTrackForCast = useCallback(
     async (track: Track): Promise<Track> => {
@@ -1027,16 +1190,19 @@ export default function App() {
         void playTrackLocally(command.track, command.positionSec || 0);
         return;
       }
-      const activeEl = isSameOriginTrack(currentTrack) ? localAudioRef.current : remoteAudioRef.current;
+      const activeEl = getActiveAudioElement();
       if (command.action === 'pause') {
+        intentionalPauseRef.current = true;
         activeEl?.pause();
         setIsPlaying(false);
         showStatus(`อุปกรณ์ "${command.fromDeviceName}" พักการเล่นชั่วคราว`);
       } else if (command.action === 'resume') {
+        intentionalPauseRef.current = false;
         activeEl?.play().then(() => setIsPlaying(true)).catch(() => {});
       } else if (command.action === 'seek' && typeof command.positionSec === 'number') {
         if (activeEl && isFinite(activeEl.duration)) {
           activeEl.currentTime = command.positionSec;
+          lastPlaybackTimeRef.current = command.positionSec;
           setCurrentTime(command.positionSec);
         }
       } else if (command.action === 'stop') {
@@ -1045,7 +1211,7 @@ export default function App() {
         showStatus(`"${command.fromDeviceName}" หยุดการแคสต์แล้ว`);
       }
     };
-  }, [currentTrack, isSameOriginTrack, playTrackLocally, showStatus, stopAllEngines]);
+  }, [getActiveAudioElement, playTrackLocally, showStatus, stopAllEngines]);
 
   // Publish this device's presence & playback state to server
   useEffect(() => {
@@ -1112,9 +1278,7 @@ export default function App() {
   }, []);
 
   const handleTriggerNativeCast = useCallback(async () => {
-    const activeEl = (isSameOriginTrack(currentTrack)
-      ? localAudioRef.current
-      : remoteAudioRef.current) as (HTMLAudioElement & {
+    const activeEl = getActiveAudioElement() as (HTMLAudioElement & {
       remote?: { prompt: () => Promise<void> };
       webkitShowPlaybackTargetPicker?: () => void;
     }) | null;
@@ -1133,7 +1297,7 @@ export default function App() {
     throw new Error(
       'เบราว์เซอร์นี้ไม่รองรับหน้าต่าง Cast ไร้สายโดยตรง — สามารถใช้วิธีเปิด Aura Audio บนอุปกรณ์ปลายทางแล้วแคสต์ผ่านรายการด้านบนได้ทันที'
     );
-  }, [currentTrack, isSameOriginTrack]);
+  }, [getActiveAudioElement]);
 
   const handleApplySinkId = useCallback(
     async (sinkId: string) => {
@@ -1194,36 +1358,40 @@ export default function App() {
       return;
     }
 
-    const usesLocalEl = isSameOriginTrack(currentTrack);
-    const activeEl = usesLocalEl ? localAudioRef.current : remoteAudioRef.current;
+    const usesLocalEl = activeEngineRef.current === 'local';
+    const activeEl = getActiveAudioElement();
     if (!activeEl) return;
 
     if (!activeEl.src || activeEl.error || activeEl.networkState === HTMLMediaElement.NETWORK_NO_SOURCE) {
-      await playTrack(currentTrack);
+      await playTrackLocally(currentTrack, lastPlaybackTimeRef.current || 0);
       return;
     }
 
     if (activeEl.paused) {
+      intentionalPauseRef.current = false;
       if (usesLocalEl) await resumeAudioContextBounded();
       try {
         await activeEl.play();
         setIsPlaying(true);
         setPlaybackError('');
       } catch {
-        // Reload track cleanly if cached audio element failed
-        await playTrackLocally(currentTrack, activeEl.currentTime || 0);
+        // Reload track cleanly from last position if cached audio element failed
+        await playTrackLocally(currentTrack, activeEl.currentTime || lastPlaybackTimeRef.current || 0);
       }
     } else {
+      intentionalPauseRef.current = true;
+      clearPlaybackTimers();
       activeEl.pause();
       setIsPlaying(false);
     }
   }, [
     activeCastTarget,
+    clearPlaybackTimers,
     currentTrack,
     displayedTracks,
+    getActiveAudioElement,
     handleRemoteCastAction,
     isPlaying,
-    isSameOriginTrack,
     playTrack,
     playTrackLocally,
     resumeAudioContextBounded,
@@ -1246,21 +1414,24 @@ export default function App() {
 
   const playPrev = useCallback(() => {
     if (activeQueue.length === 0) return;
-    const activeEl = isSameOriginTrack(currentTrack) ? localAudioRef.current : remoteAudioRef.current;
+    const activeEl = getActiveAudioElement();
     if (!activeCastTarget && activeEl && activeEl.currentTime > 3) {
       activeEl.currentTime = 0;
+      lastPlaybackTimeRef.current = 0;
       return;
     }
     const idx = activeQueue.findIndex((t) => t.id === currentTrack?.id);
     const prevIdx = idx <= 0 ? activeQueue.length - 1 : idx - 1;
     void playTrack(activeQueue[prevIdx]);
-  }, [activeCastTarget, activeQueue, currentTrack, isSameOriginTrack, playTrack]);
+  }, [activeCastTarget, activeQueue, currentTrack?.id, getActiveAudioElement, playTrack]);
 
   const handleTrackEnded = useCallback(() => {
+    clearPlaybackTimers();
     if (repeatMode === 'one' && currentTrack) {
-      const activeEl = isSameOriginTrack(currentTrack) ? localAudioRef.current : remoteAudioRef.current;
+      const activeEl = getActiveAudioElement();
       if (activeEl) {
         activeEl.currentTime = 0;
+        lastPlaybackTimeRef.current = 0;
         activeEl.play().catch(() => {});
         return;
       }
@@ -1273,10 +1444,11 @@ export default function App() {
       }
     }
     playNext();
-  }, [activeQueue, currentTrack, isSameOriginTrack, isShuffle, playNext, repeatMode]);
+  }, [activeQueue, clearPlaybackTimers, currentTrack, getActiveAudioElement, isShuffle, playNext, repeatMode]);
 
-  const handleSeek = (newTime: number) => {
+  const handleSeek = useCallback((newTime: number) => {
     if (!currentTrack) return;
+    lastPlaybackTimeRef.current = newTime;
     if (activeCastTarget) {
       setCurrentTime(newTime);
       void sendCastCommand({
@@ -1288,12 +1460,58 @@ export default function App() {
       }).catch(() => {});
       return;
     }
-    const activeEl = isSameOriginTrack(currentTrack) ? localAudioRef.current : remoteAudioRef.current;
+    const activeEl = getActiveAudioElement();
     if (activeEl && isFinite(activeEl.duration)) {
       activeEl.currentTime = newTime;
       setCurrentTime(newTime);
     }
-  };
+  }, [activeCastTarget, currentTrack, deviceIdentity.deviceId, deviceIdentity.deviceName, getActiveAudioElement]);
+
+  // Register MediaSession metadata & transport controls to prevent background playback drops on Android/mobile
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+    if (currentTrack && typeof MediaMetadata !== 'undefined') {
+      ms.metadata = new MediaMetadata({
+        title: currentTrack.title,
+        artist: currentTrack.artist,
+        album: currentTrack.album || 'Aura Audio',
+      });
+    }
+    ms.playbackState = isPlaying ? 'playing' : 'paused';
+  }, [currentTrack, isPlaying]);
+
+  useEffect(() => {
+    if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
+    const ms = navigator.mediaSession;
+    const safeSet = (action: MediaSessionAction, handler: MediaSessionActionHandler | null) => {
+      try {
+        ms.setActionHandler(action, handler);
+      } catch {
+        // ignore unsupported media action
+      }
+    };
+    safeSet('play', () => {
+      if (!isPlayingRef.current) void togglePlayPause();
+    });
+    safeSet('pause', () => {
+      if (isPlayingRef.current) void togglePlayPause();
+    });
+    safeSet('previoustrack', () => playPrev());
+    safeSet('nexttrack', () => playNext());
+    safeSet('seekto', (details) => {
+      if (typeof details.seekTime === 'number' && isFinite(details.seekTime)) {
+        handleSeek(details.seekTime);
+      }
+    });
+    return () => {
+      safeSet('play', null);
+      safeSet('pause', null);
+      safeSet('previoustrack', null);
+      safeSet('nexttrack', null);
+      safeSet('seekto', null);
+    };
+  }, [handleSeek, playNext, playPrev, togglePlayPause]);
 
   // Keyboard shortcuts
   useEffect(() => {
@@ -2207,10 +2425,12 @@ export default function App() {
 
   return (
     <div className="h-dvh flex flex-col bg-background text-foreground">
-      {/* Dual Audio Elements */}
+      {/* Dual Audio Elements with Auto-Reconnect & Stall Recovery */}
       <audio
         ref={localAudioRef}
+        preload="auto"
         onLoadedMetadata={(e) => {
+          if (activeEngineRef.current !== 'local') return;
           const el = e.currentTarget;
           if (isFinite(el.duration) && el.duration > 0) {
             setDuration(el.duration);
@@ -2228,38 +2448,142 @@ export default function App() {
           }
         }}
         onTimeUpdate={(e) => {
+          if (activeEngineRef.current !== 'local') return;
           const el = e.currentTarget;
+          lastPlaybackTimeRef.current = el.currentTime;
           setCurrentTime(el.currentTime);
-          if (isFinite(el.duration)) setDuration(el.duration);
+          if (isFinite(el.duration) && el.duration > 0) setDuration(el.duration);
+          if (stallTimerRef.current !== null) {
+            window.clearTimeout(stallTimerRef.current);
+            stallTimerRef.current = null;
+          }
         }}
-        onEnded={handleTrackEnded}
-        onWaiting={() => setIsBuffering(true)}
+        onEnded={() => {
+          if (activeEngineRef.current !== 'local') return;
+          handleTrackEnded();
+        }}
+        onWaiting={() => {
+          if (activeEngineRef.current !== 'local') return;
+          setIsBuffering(true);
+          if (stallTimerRef.current === null && isPlayingRef.current) {
+            stallTimerRef.current = window.setTimeout(() => {
+              stallTimerRef.current = null;
+              if (activeEngineRef.current === 'local' && isPlayingRef.current) {
+                attemptRecoveryRef.current('stalled');
+              }
+            }, 8000);
+          }
+        }}
+        onStalled={() => {
+          if (activeEngineRef.current !== 'local' || !isPlayingRef.current) return;
+          if (stallTimerRef.current === null) {
+            stallTimerRef.current = window.setTimeout(() => {
+              stallTimerRef.current = null;
+              if (activeEngineRef.current === 'local' && isPlayingRef.current) {
+                attemptRecoveryRef.current('stalled');
+              }
+            }, 7000);
+          }
+        }}
         onPlaying={() => {
+          if (activeEngineRef.current !== 'local') return;
+          if (stallTimerRef.current !== null) {
+            window.clearTimeout(stallTimerRef.current);
+            stallTimerRef.current = null;
+          }
+          playbackRetryCountRef.current = 0;
           setIsBuffering(false);
           setIsPlaying(true);
+          setPlaybackError('');
+        }}
+        onPause={(e) => {
+          if (activeEngineRef.current !== 'local') return;
+          if (!e.currentTarget.ended && !intentionalPauseRef.current && isPlayingRef.current) {
+            setIsPlaying(false);
+          }
         }}
         onError={() => {
-          setIsBuffering(false);
-          setIsPlaying(false);
+          if (activeEngineRef.current !== 'local' || intentionalPauseRef.current) return;
+          if (isPlayingRef.current) {
+            attemptRecoveryRef.current('error');
+          } else {
+            setIsBuffering(false);
+            setIsPlaying(false);
+          }
         }}
       />
       <audio
         ref={remoteAudioRef}
-        onTimeUpdate={(e) => {
+        preload="auto"
+        onLoadedMetadata={(e) => {
+          if (activeEngineRef.current !== 'remote') return;
           const el = e.currentTarget;
-          setCurrentTime(el.currentTime);
-          if (isFinite(el.duration)) setDuration(el.duration);
+          if (isFinite(el.duration) && el.duration > 0) setDuration(el.duration);
         }}
-        onEnded={handleTrackEnded}
-        onWaiting={() => setIsBuffering(true)}
+        onTimeUpdate={(e) => {
+          if (activeEngineRef.current !== 'remote') return;
+          const el = e.currentTarget;
+          lastPlaybackTimeRef.current = el.currentTime;
+          setCurrentTime(el.currentTime);
+          if (isFinite(el.duration) && el.duration > 0) setDuration(el.duration);
+          if (stallTimerRef.current !== null) {
+            window.clearTimeout(stallTimerRef.current);
+            stallTimerRef.current = null;
+          }
+        }}
+        onEnded={() => {
+          if (activeEngineRef.current !== 'remote') return;
+          handleTrackEnded();
+        }}
+        onWaiting={() => {
+          if (activeEngineRef.current !== 'remote') return;
+          setIsBuffering(true);
+          if (stallTimerRef.current === null && isPlayingRef.current) {
+            stallTimerRef.current = window.setTimeout(() => {
+              stallTimerRef.current = null;
+              if (activeEngineRef.current === 'remote' && isPlayingRef.current) {
+                attemptRecoveryRef.current('stalled');
+              }
+            }, 8000);
+          }
+        }}
+        onStalled={() => {
+          if (activeEngineRef.current !== 'remote' || !isPlayingRef.current) return;
+          if (stallTimerRef.current === null) {
+            stallTimerRef.current = window.setTimeout(() => {
+              stallTimerRef.current = null;
+              if (activeEngineRef.current === 'remote' && isPlayingRef.current) {
+                attemptRecoveryRef.current('stalled');
+              }
+            }, 7000);
+          }
+        }}
         onPlaying={() => {
+          if (activeEngineRef.current !== 'remote') return;
+          if (stallTimerRef.current !== null) {
+            window.clearTimeout(stallTimerRef.current);
+            stallTimerRef.current = null;
+          }
+          playbackRetryCountRef.current = 0;
           setIsBuffering(false);
           setIsPlaying(true);
+          setPlaybackError('');
+        }}
+        onPause={(e) => {
+          if (activeEngineRef.current !== 'remote') return;
+          if (!e.currentTarget.ended && !intentionalPauseRef.current && isPlayingRef.current) {
+            setIsPlaying(false);
+          }
         }}
         onError={() => {
-          setIsBuffering(false);
-          setIsPlaying(false);
-          setPlaybackError('ไม่สามารถเชื่อมต่อสตรีมจากลิงก์ภายนอกนี้ได้');
+          if (activeEngineRef.current !== 'remote' || intentionalPauseRef.current) return;
+          if (isPlayingRef.current) {
+            attemptRecoveryRef.current('error');
+          } else {
+            setIsBuffering(false);
+            setIsPlaying(false);
+            setPlaybackError('ไม่สามารถเชื่อมต่อสตรีมจากลิงก์นี้ได้');
+          }
         }}
       />
 
@@ -3190,7 +3514,7 @@ export default function App() {
                 <VisualizerCanvas
                   analyser={analyserRef.current}
                   isPlaying={isPlaying}
-                  isSynthOrCors={isSameOriginTrack(currentTrack)}
+                  isSynthOrCors={activeEngineRef.current === 'local' && isSameOriginTrack(currentTrack)}
                 />
               </div>
             </Surface>

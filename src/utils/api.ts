@@ -398,8 +398,13 @@ export function subscribeToStreamEvents(
   }
   const query = params.toString();
   const source = new EventSource(apiUrl(`/api/streams/events${query ? `?${query}` : ''}`));
+  let hasOpenedOnce = false;
   source.onopen = () => {
     onStatusEvent?.('connected');
+    if (hasOpenedOnce) {
+      onLibraryUpdate({ type: 'connected' });
+    }
+    hasOpenedOnce = true;
   };
   source.onerror = () => {
     onStatusEvent?.('reconnecting');

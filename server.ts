@@ -247,9 +247,12 @@ async function ensureDataDir(): Promise<void> {
   await fsp.mkdir(DATA_DIR, { recursive: true });
 }
 
+const fileWriteQueues = new Map<string, Promise<void>>();
+
 async function readJsonFile<T>(filePath: string, fallback: T): Promise<T> {
   try {
     const raw = await fsp.readFile(filePath, 'utf8');
+    if (!raw.trim()) return fallback;
     return JSON.parse(raw) as T;
   } catch {
     return fallback;
@@ -257,8 +260,26 @@ async function readJsonFile<T>(filePath: string, fallback: T): Promise<T> {
 }
 
 async function writeJsonFile(filePath: string, data: unknown): Promise<void> {
-  await ensureDataDir();
-  await fsp.writeFile(filePath, JSON.stringify(data, null, 2), 'utf8');
+  const prev = fileWriteQueues.get(filePath) || Promise.resolve();
+  const next = prev
+    .catch(() => {})
+    .then(async () => {
+      await ensureDataDir();
+      const tmpPath = `${filePath}.${process.pid}.${Date.now()}.${Math.random()
+        .toString(36)
+        .slice(2, 7)}.tmp`;
+      const serialized = JSON.stringify(data, null, 2);
+      await fsp.writeFile(tmpPath, serialized, 'utf8');
+      await fsp.rename(tmpPath, filePath);
+    });
+  fileWriteQueues.set(filePath, next);
+  try {
+    await next;
+  } finally {
+    if (fileWriteQueues.get(filePath) === next) {
+      fileWriteQueues.delete(filePath);
+    }
+  }
 }
 
 async function ensureSeedAdmin(): Promise<void> {
@@ -390,9 +411,28 @@ function streamAudioFileWithRange(
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Range');
   res.setHeader('Access-Control-Expose-Headers', 'Content-Range, Accept-Ranges, Content-Length');
+  res.setHeader('Cross-Origin-Resource-Policy', 'cross-origin');
   res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Content-Type', contentType);
   res.setHeader('Cache-Control', 'public, max-age=3600');
+
+  const attachStreamCleanup = (stream: fs.ReadStream) => {
+    const cleanup = () => {
+      if (!stream.destroyed) {
+        stream.destroy();
+      }
+    };
+    req.on('close', cleanup);
+    res.on('close', cleanup);
+    stream.on('error', () => {
+      cleanup();
+      if (!res.headersSent) {
+        res.status(500).end();
+      } else if (!res.writableEnded) {
+        res.end();
+      }
+    });
+  };
 
   const rangeHeader = req.headers.range;
   if (rangeHeader) {
@@ -416,9 +456,7 @@ function streamAudioFileWithRange(
     res.setHeader('Content-Length', String(chunkSize));
 
     const stream = fs.createReadStream(filePath, { start, end });
-    stream.on('error', () => {
-      if (!res.headersSent) res.status(500).end();
-    });
+    attachStreamCleanup(stream);
     stream.pipe(res);
     return;
   }
@@ -426,9 +464,7 @@ function streamAudioFileWithRange(
   res.status(200);
   res.setHeader('Content-Length', String(fileSize));
   const stream = fs.createReadStream(filePath);
-  stream.on('error', () => {
-    if (!res.headersSent) res.status(500).end();
-  });
+  attachStreamCleanup(stream);
   stream.pipe(res);
 }
 
@@ -636,6 +672,10 @@ async function removeMountedFolderPath(resolvedDir?: string): Promise<void> {
 async function rescanMountedFolder(resolvedDir: string, reasonLabel?: string): Promise<StoredStreamTrack[]> {
   await addMountedFolderPath(resolvedDir);
   const existing = await readJsonFile<StoredStreamTrack[]>(HOST_HDD_INDEX_FILE, []);
+  if (!fs.existsSync(resolvedDir)) {
+    // Preserve indexed entries if mounted folder is temporarily offline/sleeping
+    return existing.filter((item) => item.sourceFolder === resolvedDir);
+  }
   const cachedByPath = new Map(
     existing
       .filter((item) => item.filePath)
@@ -863,8 +903,9 @@ async function startServer(): Promise<void> {
   // --- SSE Real-Time Sync & Device Cast Across Connected Devices ---
   app.get('/api/streams/events', (req, res) => {
     res.setHeader('Content-Type', 'text/event-stream');
-    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders?.();
 
     const rawDeviceId = typeof req.query.deviceId === 'string' ? req.query.deviceId.trim() : '';
@@ -900,9 +941,10 @@ async function startServer(): Promise<void> {
       try {
         res.write(': ping\n\n');
       } catch {
+        clearInterval(keepAlive);
         sseClients.delete(res);
       }
-    }, 25000);
+    }, 20000);
 
     req.on('close', () => {
       clearInterval(keepAlive);

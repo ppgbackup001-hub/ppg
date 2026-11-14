@@ -202,7 +202,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onPause() {
-        webView.onPause()
+        // Keep WebView active on pause so audio streaming continues when screen locks or switching apps
         super.onPause()
     }
 
