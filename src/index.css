@@ -1,0 +1,111 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-background: oklch(0.965 0.008 85);
+  --color-surface: oklch(0.992 0.004 85);
+  --color-foreground: oklch(0.20 0.015 60);
+  --color-muted: oklch(0.46 0.015 70);
+  --color-border: oklch(0.84 0.012 80);
+  --color-primary: oklch(0.55 0.16 32);
+  --color-primary-foreground: oklch(0.99 0.004 85);
+
+  --font-sans: "Instrument Sans", "Noto Sans Thai", sans-serif;
+  --font-mono: "Geist Mono", monospace;
+
+  --text-display: clamp(1.5rem, 1.2rem + 0.9vw, 2.125rem);
+  --text-display--line-height: 1.15;
+  --text-display--font-weight: 600;
+
+  --radius-card: 0.75rem;
+  --radius-control: 0.5rem;
+  --shadow-surface: 0 1px 2px rgba(28, 25, 23, 0.04);
+}
+
+.dark {
+  --color-background: oklch(0.14 0.008 60);
+  --color-surface: oklch(0.185 0.008 60);
+  --color-foreground: oklch(0.93 0.008 85);
+  --color-muted: oklch(0.66 0.012 75);
+  --color-border: oklch(0.29 0.01 60);
+  --color-primary: oklch(0.68 0.16 35);
+  --color-primary-foreground: oklch(0.14 0.008 60);
+  --shadow-surface: 0 1px 2px rgba(0, 0, 0, 0.25);
+}
+
+html {
+  font-synthesis-weight: none;
+}
+
+/* Minimalist scrollbar */
+::-webkit-scrollbar {
+  width: 5px;
+  height: 5px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: color-mix(in oklch, var(--color-muted) 28%, transparent);
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in oklch, var(--color-muted) 48%, transparent);
+}
+
+/* Minimalist audio range sliders */
+input[type="range"].aura-range {
+  -webkit-appearance: none;
+  appearance: none;
+  background: transparent;
+  cursor: pointer;
+}
+input[type="range"].aura-range::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 9999px;
+  background: color-mix(in oklch, var(--color-muted) 26%, transparent);
+}
+input[type="range"].aura-range::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 12px;
+  height: 12px;
+  border-radius: 9999px;
+  background: var(--color-foreground);
+  margin-top: -4px;
+  transition: transform 150ms ease-out;
+}
+input[type="range"].aura-range:hover::-webkit-slider-thumb,
+input[type="range"].aura-range:focus-visible::-webkit-slider-thumb {
+  transform: scale(1.18);
+  background: var(--color-primary);
+}
+
+/* Vinyl spin animation */
+@keyframes vinyl-spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-vinyl {
+  animation: vinyl-spin 22s linear infinite;
+}
+
+.paused-vinyl {
+  animation-play-state: paused;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *:not(.animate-spin):not(.animate-pulse),
+  *:not(.animate-spin):not(.animate-pulse)::before,
+  *:not(.animate-spin):not(.animate-pulse)::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

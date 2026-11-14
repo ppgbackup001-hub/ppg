@@ -1,0 +1,1122 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AURA — Minimalist Music Player</title>
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <!-- Google Fonts: Inter & Noto Sans Thai -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=Noto+Sans+Thai:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    fontFamily: {
+                        sans: ['Inter', 'Noto Sans Thai', 'sans-serif'],
+                    },
+                    colors: {
+                        surface: {
+                            light: '#ffffff',
+                            dark: '#121212',
+                        },
+                        background: {
+                            light: '#f8f9fa',
+                            dark: '#0a0a0a',
+                        }
+                    }
+                }
+            }
+        }
+    </script>
+    <style>
+        /* Custom minimalist scrollbar */
+        ::-webkit-scrollbar {
+            width: 4px;
+            height: 4px;
+        }
+        ::-webkit-scrollbar-track {
+            background: transparent;
+        }
+        ::-webkit-scrollbar-thumb {
+            background: rgba(156, 163, 175, 0.3);
+            border-radius: 9999px;
+        }
+        ::-webkit-scrollbar-thumb:hover {
+            background: rgba(156, 163, 175, 0.5);
+        }
+
+        /* Custom Range Input (Progress & Volume) */
+        input[type=range] {
+            -webkit-appearance: none;
+            background: transparent;
+        }
+        input[type=range]::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            height: 12px;
+            width: 12px;
+            border-radius: 50%;
+            background: currentColor;
+            cursor: pointer;
+            margin-top: -4px;
+            opacity: 0;
+            transition: opacity 0.2s, transform 0.1s;
+        }
+        .group:hover input[type=range]::-webkit-slider-thumb,
+        input[type=range]:focus::-webkit-slider-thumb {
+            opacity: 1;
+        }
+        input[type=range]::-webkit-slider-thumb:hover {
+            transform: scale(1.2);
+        }
+        input[type=range]::-webkit-slider-runnable-track {
+            width: 100%;
+            height: 4px;
+            cursor: pointer;
+            background: rgba(156, 163, 175, 0.25);
+            border-radius: 9999px;
+        }
+
+        /* Subtle rotating album art animation */
+        @keyframes spin-slow {
+            from { transform: rotate(0deg); }
+            to { transform: rotate(360deg); }
+        }
+        .animate-spin-slow {
+            animation: spin-slow 24s linear infinite;
+        }
+        .paused-animation {
+            animation-play-state: paused;
+        }
+    </style>
+</head>
+<body class="bg-background-light text-zinc-800 dark:bg-background-dark dark:text-zinc-200 font-sans antialiased selection:bg-zinc-800 selection:text-white dark:selection:bg-white dark:selection:text-black transition-colors duration-300 overflow-hidden h-screen flex flex-col">
+
+    <!-- Hidden Audio Element -->
+    <audio id="audio-player" crossorigin="anonymous"></audio>
+    <!-- Hidden File Input supporting all audio formats -->
+    <input type="file" id="local-file-input" accept="audio/*,.mp3,.wav,.flac,.ogg,.aac,.m4a,.wma,.aiff,.opus" multiple class="hidden">
+
+    <!-- Toast Notification Container -->
+    <div id="toast-container" class="fixed top-5 right-5 z-50 flex flex-col gap-2 pointer-events-none"></div>
+
+    <!-- Main App Container -->
+    <div class="flex-1 flex overflow-hidden">
+        
+        <!-- Sidebar Navigation (Desktop) -->
+        <aside class="w-64 bg-surface-light dark:bg-surface-dark border-r border-zinc-200/70 dark:border-zinc-800/70 hidden md:flex flex-col justify-between p-6 transition-colors duration-300">
+            <div>
+                <!-- Brand Logo -->
+                <div class="flex items-center gap-3 mb-10">
+                    <div class="w-8 h-8 rounded-full bg-zinc-900 dark:bg-white flex items-center justify-center text-white dark:text-zinc-900">
+                        <i data-lucide="disc" class="w-4 h-4"></i>
+                    </div>
+                    <span class="font-semibold tracking-widest text-sm uppercase">Aura Audio</span>
+                </div>
+
+                <!-- Navigation Menu -->
+                <nav class="space-y-1.5">
+                    <button onclick="switchTab('all')" id="nav-all" class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium bg-zinc-100 dark:bg-zinc-800/80 text-zinc-900 dark:text-white transition-all">
+                        <i data-lucide="layers" class="w-4 h-4"></i>
+                        <span>คลังเพลงทั้งหมด</span>
+                    </button>
+                    <button onclick="switchTab('stream')" id="nav-stream" class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white hover:bg-zinc-50 dark:hover:bg-zinc-800/40 transition-all">
+                        <i data-lucide="radio" class="w-4 h-4"></i>
+                        <span>สตรีมมิ่งออนไลน์</span>
+                    </button>
+                    <button onclick="switchTab('local')" id="nav-local" class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white hover:bg-zinc-50 dark:hover:bg-zinc-800/40 transition-all">
+                        <i data-lucide="hard-drive" class="w-4 h-4"></i>
+                        <span>ไฟล์ในเครื่อง</span>
+                    </button>
+                    <button onclick="switchTab('favorites')" id="nav-favorites" class="nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white hover:bg-zinc-50 dark:hover:bg-zinc-800/40 transition-all">
+                        <i data-lucide="heart" class="w-4 h-4"></i>
+                        <span>เพลงที่ถูกใจ</span>
+                    </button>
+                </nav>
+
+                <!-- Upload Local Files Action -->
+                <div class="mt-8 pt-6 border-t border-zinc-200/70 dark:border-zinc-800/70">
+                    <button onclick="triggerFileUpload()" class="w-full py-2.5 px-4 rounded-xl border border-dashed border-zinc-300 dark:border-zinc-700 hover:border-zinc-900 dark:hover:border-white text-xs font-medium text-zinc-600 dark:text-zinc-300 flex items-center justify-center gap-2 transition-all group">
+                        <i data-lucide="plus" class="w-4 h-4 group-hover:scale-110 transition-transform"></i>
+                        <span>เพิ่มไฟล์เพลงจากเครื่อง</span>
+                    </button>
+                    <p class="text-[10px] text-zinc-400 text-center mt-2">รองรับ MP3, FLAC, WAV, OGG, AAC ฯลฯ</p>
+                </div>
+            </div>
+
+            <!-- User Profile Card (Sidebar Bottom) -->
+            <div class="pt-4 border-t border-zinc-200/70 dark:border-zinc-800/70">
+                <button onclick="openAuthModal()" id="sidebar-user-btn" class="w-full flex items-center justify-between p-2 rounded-xl hover:bg-zinc-100 dark:hover:bg-zinc-800/60 transition-colors text-left">
+                    <div class="flex items-center gap-3 overflow-hidden">
+                        <div id="user-avatar" class="w-8 h-8 rounded-full bg-zinc-200 dark:bg-zinc-800 flex items-center justify-center text-xs font-semibold shrink-0">
+                            <i data-lucide="user" class="w-4 h-4 text-zinc-500"></i>
+                        </div>
+                        <div class="truncate">
+                            <p id="user-display-name" class="text-xs font-medium truncate">ผู้เยี่ยมชม (Guest)</p>
+                            <p id="user-status-text" class="text-[10px] text-zinc-400 truncate">คลิกเพื่อเข้าสู่ระบบ</p>
+                        </div>
+                    </div>
+                    <i data-lucide="chevron-right" class="w-4 h-4 text-zinc-400 shrink-0"></i>
+                </button>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="flex-1 flex flex-col overflow-hidden relative">
+            
+            <!-- Top Header -->
+            <header class="h-16 px-4 md:px-8 border-b border-zinc-200/70 dark:border-zinc-800/70 flex items-center justify-between bg-surface-light/80 dark:bg-surface-dark/80 backdrop-blur-md z-10">
+                <!-- Mobile Logo & Menu -->
+                <div class="flex items-center gap-3 md:hidden">
+                    <div class="w-7 h-7 rounded-full bg-zinc-900 dark:bg-white flex items-center justify-center text-white dark:text-zinc-900">
+                        <i data-lucide="disc" class="w-3.5 h-3.5"></i>
+                    </div>
+                    <span class="font-semibold tracking-wider text-xs uppercase">Aura</span>
+                </div>
+
+                <!-- Search Bar -->
+                <div class="flex-1 max-w-md mx-4 md:mx-0">
+                    <div class="relative">
+                        <i data-lucide="search" class="w-4 h-4 text-zinc-400 absolute left-3.5 top-1/2 -translate-y-1/2"></i>
+                        <input type="text" id="search-input" placeholder="ค้นหาชื่อเพลง, ศิลปิน หรือรูปแบบไฟล์..." class="w-full bg-zinc-100/80 dark:bg-zinc-900/80 text-xs rounded-full pl-10 pr-4 py-2 focus:outline-none focus:ring-1 focus:ring-zinc-400 dark:focus:ring-zinc-600 transition-all">
+                    </div>
+                </div>
+
+                <!-- Right Controls: Upload (Mobile), Theme Toggle, User (Mobile) -->
+                <div class="flex items-center gap-2">
+                    <button onclick="triggerFileUpload()" title="เพิ่มไฟล์เพลง" class="md:hidden p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300">
+                        <i data-lucide="folder-plus" class="w-4 h-4"></i>
+                    </button>
+                    <button onclick="toggleTheme()" title="สลับโหมดสว่าง/มืด" class="p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300 transition-colors">
+                        <i data-lucide="moon" id="theme-icon" class="w-4 h-4"></i>
+                    </button>
+                    <button onclick="openAuthModal()" class="md:hidden p-2 rounded-full hover:bg-zinc-100 dark:hover:bg-zinc-800 text-zinc-600 dark:text-zinc-300">
+                        <i data-lucide="user" class="w-4 h-4"></i>
+                    </button>
+                </div>
+            </header>
+
+            <!-- Mobile Category Pills -->
+            <div class="flex md:hidden items-center gap-2 px-4 py-2.5 overflow-x-auto border-b border-zinc-200/50 dark:border-zinc-800/50 bg-surface-light dark:bg-surface-dark shrink-0">
+                <button onclick="switchTab('all')" id="mob-nav-all" class="mob-nav-btn px-3 py-1 rounded-full text-xs font-medium bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 whitespace-nowrap">ทั้งหมด</button>
+                <button onclick="switchTab('stream')" id="mob-nav-stream" class="mob-nav-btn px-3 py-1 rounded-full text-xs font-medium bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400 whitespace-nowrap">สตรีมออนไลน์</button>
+                <button onclick="switchTab('local')" id="mob-nav-local" class="mob-nav-btn px-3 py-1 rounded-full text-xs font-medium bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400 whitespace-nowrap">ไฟล์ในเครื่อง</button>
+                <button onclick="switchTab('favorites')" id="mob-nav-favorites" class="mob-nav-btn px-3 py-1 rounded-full text-xs font-medium bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400 whitespace-nowrap">ถูกใจ</button>
+            </div>
+
+            <!-- Scrollable Track List & Visualizer Area -->
+            <div id="drop-zone" class="flex-1 overflow-y-auto p-4 md:p-8 relative">
+                
+                <!-- Drag & Drop Overlay -->
+                <div id="drag-overlay" class="hidden absolute inset-4 rounded-2xl border-2 border-dashed border-zinc-900 dark:border-white bg-white/90 dark:bg-zinc-950/90 z-30 flex flex-col items-center justify-center backdrop-blur-sm">
+                    <i data-lucide="upload-cloud" class="w-10 h-10 mb-3 text-zinc-800 dark:text-zinc-200 animate-bounce"></i>
+                    <p class="text-sm font-medium">วางไฟล์เพลงที่นี่เพื่อเล่นทันที</p>
+                    <p class="text-xs text-zinc-400 mt-1">รองรับทุกนามสกุลไฟล์เสียง</p>
+                </div>
+
+                <!-- Section Header -->
+                <div class="flex flex-col sm:flex-row sm:items-end justify-between mb-6 gap-2">
+                    <div>
+                        <p class="text-[11px] uppercase tracking-widest text-zinc-400 mb-1" id="section-subtitle">Library</p>
+                        <h1 class="text-xl md:text-2xl font-light tracking-tight" id="section-title">คลังเพลงทั้งหมด</h1>
+                    </div>
+                    <div class="flex items-center gap-3 text-xs text-zinc-400">
+                        <span id="track-count">0 เพลง</span>
+                        <button onclick="playAllFiltered()" class="px-3.5 py-1.5 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 font-medium hover:opacity-90 transition-opacity flex items-center gap-1.5">
+                            <i data-lucide="play" class="w-3 h-3 fill-current"></i>
+                            <span>เล่นทั้งหมด</span>
+                        </button>
+                    </div>
+                </div>
+
+                <!-- Audio Visualizer Canvas (Minimalist Waveform) -->
+                <div class="mb-6 bg-surface-light dark:bg-surface-dark rounded-2xl p-4 border border-zinc-200/60 dark:border-zinc-800/60 flex items-center justify-between gap-4">
+                    <div class="flex items-center gap-3 min-w-0">
+                        <div class="w-10 h-10 rounded-xl bg-zinc-100 dark:bg-zinc-800 flex items-center justify-center shrink-0 overflow-hidden">
+                            <img id="banner-art" src="https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=200&auto=format&fit=crop&q=60" alt="Cover" class="w-full h-full object-cover">
+                        </div>
+                        <div class="truncate">
+                            <div class="flex items-center gap-2">
+                                <span id="banner-badge" class="text-[10px] px-2 py-0.5 rounded-full bg-zinc-100 dark:bg-zinc-800 text-zinc-500 font-medium">พร้อมเล่น</span>
+                                <span id="banner-format" class="text-[10px] text-zinc-400 uppercase font-mono">STREAM</span>
+                            </div>
+                            <p id="banner-title" class="text-sm font-medium truncate mt-0.5">เลือกเพลงเพื่อเริ่มฟัง</p>
+                        </div>
+                    </div>
+                    <div class="w-32 sm:w-48 h-10 shrink-0">
+                        <canvas id="visualizer" class="w-full h-full"></canvas>
+                    </div>
+                </div>
+
+                <!-- Track List Table / Cards -->
+                <div class="bg-surface-light dark:bg-surface-dark rounded-2xl border border-zinc-200/60 dark:border-zinc-800/60 overflow-hidden">
+                    <div class="grid grid-cols-12 gap-2 px-4 py-3 border-b border-zinc-200/60 dark:border-zinc-800/60 text-[11px] font-medium text-zinc-400 uppercase tracking-wider">
+                        <div class="col-span-1 text-center">#</div>
+                        <div class="col-span-6 sm:col-span-5">ชื่อเพลง</div>
+                        <div class="col-span-3 hidden sm:block">แหล่งที่มา / รูปแบบ</div>
+                        <div class="col-span-3 sm:col-span-2 text-right">เวลา</div>
+                        <div class="col-span-2 sm:col-span-1 text-center"></div>
+                    </div>
+                    <div id="track-list-container" class="divide-y divide-zinc-100 dark:divide-zinc-800/50">
+                        <!-- Tracks will be injected here via JS -->
+                    </div>
+                </div>
+
+                <!-- Empty State -->
+                <div id="empty-state" class="hidden py-16 text-center">
+                    <div class="w-12 h-12 rounded-full bg-zinc-100 dark:bg-zinc-800/80 flex items-center justify-center mx-auto mb-3 text-zinc-400">
+                        <i data-lucide="music" class="w-5 h-5"></i>
+                    </div>
+                    <p class="text-sm font-medium text-zinc-600 dark:text-zinc-300">ไม่พบรายการเพลงในหมวดหมู่นี้</p>
+                    <p class="text-xs text-zinc-400 mt-1 mb-4">คุณสามารถลากไฟล์เพลงมาวาง หรือกดปุ่มเพิ่มไฟล์จากเครื่องได้ทันที</p>
+                    <button onclick="triggerFileUpload()" class="px-4 py-2 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-medium">
+                        เลือกไฟล์เพลงจากเครื่อง
+                    </button>
+                </div>
+
+            </div>
+        </main>
+    </div>
+
+    <!-- Bottom Minimalist Player Bar -->
+    <footer class="h-24 bg-surface-light dark:bg-surface-dark border-t border-zinc-200/80 dark:border-zinc-800/80 px-4 md:px-8 flex items-center justify-between z-20 shrink-0 transition-colors duration-300">
+        
+        <!-- Left: Now Playing Info -->
+        <div class="flex items-center gap-3.5 w-1/3 min-w-0">
+            <div class="relative w-12 h-12 rounded-full overflow-hidden bg-zinc-100 dark:bg-zinc-800 shrink-0 border border-zinc-200/50 dark:border-zinc-700/50">
+                <img id="player-cover" src="https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=200&auto=format&fit=crop&q=60" alt="Album Art" class="w-full h-full object-cover animate-spin-slow paused-animation">
+                <div class="w-2.5 h-2.5 rounded-full bg-surface-light dark:bg-surface-dark absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 border border-zinc-300 dark:border-zinc-600"></div>
+            </div>
+            <div class="min-w-0 flex-1">
+                <h4 id="player-title" class="text-xs sm:text-sm font-medium truncate">ยังไม่ได้เลือกเพลง</h4>
+                <p id="player-artist" class="text-[11px] text-zinc-400 truncate">Aura Minimal Player</p>
+            </div>
+            <button onclick="toggleCurrentFavorite()" id="player-fav-btn" class="p-1.5 text-zinc-400 hover:text-rose-500 transition-colors hidden sm:block">
+                <i data-lucide="heart" class="w-4 h-4"></i>
+            </button>
+        </div>
+
+        <!-- Center: Playback Controls & Progress -->
+        <div class="flex flex-col items-center max-w-md w-1/3">
+            <div class="flex items-center gap-4 sm:gap-6 mb-1.5">
+                <button onclick="toggleShuffle()" id="btn-shuffle" title="สุ่มเพลง" class="text-zinc-400 hover:text-zinc-900 dark:hover:text-white transition-colors">
+                    <i data-lucide="shuffle" class="w-3.5 h-3.5"></i>
+                </button>
+                <button onclick="prevTrack()" title="เพลงก่อนหน้า" class="text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-white transition-colors">
+                    <i data-lucide="skip-back" class="w-4 h-4 fill-current"></i>
+                </button>
+                <button onclick="togglePlay()" id="btn-play-pause" title="เล่น / หยุด" class="w-9 h-9 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 flex items-center justify-center hover:scale-105 active:scale-95 transition-all shadow-sm">
+                    <i data-lucide="play" id="play-pause-icon" class="w-4 h-4 fill-current ml-0.5"></i>
+                </button>
+                <button onclick="nextTrack()" title="เพลงถัดไป" class="text-zinc-600 dark:text-zinc-300 hover:text-zinc-900 dark:hover:text-white transition-colors">
+                    <i data-lucide="skip-forward" class="w-4 h-4 fill-current"></i>
+                </button>
+                <button onclick="toggleRepeat()" id="btn-repeat" title="เล่นซ้ำ" class="text-zinc-400 hover:text-zinc-900 dark:hover:text-white transition-colors">
+                    <i data-lucide="repeat" class="w-3.5 h-3.5"></i>
+                </button>
+            </div>
+            
+            <!-- Progress Bar -->
+            <div class="w-full flex items-center gap-2.5 group">
+                <span id="time-current" class="text-[10px] font-mono text-zinc-400 w-8 text-right">0:00</span>
+                <input type="range" id="progress-bar" value="0" min="0" max="100" step="0.1" class="flex-1 text-zinc-900 dark:text-white">
+                <span id="time-total" class="text-[10px] font-mono text-zinc-400 w-8">0:00</span>
+            </div>
+        </div>
+
+        <!-- Right: Volume & Extra Controls -->
+        <div class="flex items-center justify-end gap-3 w-1/3">
+            <button onclick="openStreamUrlModal()" title="เพิ่มลิงก์สตรีมมิ่ง URL" class="p-2 rounded-lg text-zinc-400 hover:text-zinc-900 dark:hover:text-white hover:bg-zinc-100 dark:hover:bg-zinc-800 transition-colors hidden sm:flex items-center gap-1.5 text-xs">
+                <i data-lucide="link" class="w-3.5 h-3.5"></i>
+                <span class="hidden lg:inline">สตรีม URL</span>
+            </button>
+            <div class="hidden sm:flex items-center gap-2 w-24 group">
+                <button onclick="toggleMute()" id="btn-mute" class="text-zinc-500 hover:text-zinc-900 dark:hover:text-white">
+                    <i data-lucide="volume-2" id="volume-icon" class="w-4 h-4"></i>
+                </button>
+                <input type="range" id="volume-bar" value="80" min="0" max="100" class="w-full text-zinc-900 dark:text-white">
+            </div>
+        </div>
+    </footer>
+
+    <!-- User Authentication Modal -->
+    <div id="auth-modal" class="fixed inset-0 bg-black/40 backdrop-blur-xs z-50 hidden items-center justify-center p-4">
+        <div class="bg-surface-light dark:bg-surface-dark border border-zinc-200 dark:border-zinc-800 rounded-2xl max-w-sm w-full p-6 shadow-xl transition-all">
+            <div class="flex items-center justify-between mb-6">
+                <h3 class="text-base font-medium" id="auth-modal-title">บัญชีผู้ใช้งาน</h3>
+                <button onclick="closeAuthModal()" class="text-zinc-400 hover:text-zinc-900 dark:hover:text-white">
+                    <i data-lucide="x" class="w-4 h-4"></i>
+                </button>
+            </div>
+
+            <!-- Logged Out View -->
+            <div id="auth-form-view">
+                <p class="text-xs text-zinc-400 mb-4">เข้าสู่ระบบเพื่อซิงค์รายการเพลงโปรดและประวัติการฟังของคุณ</p>
+                <form onsubmit="handleLogin(event)" class="space-y-3">
+                    <div>
+                        <label class="block text-[11px] font-medium text-zinc-500 mb-1">ชื่อผู้ใช้งาน (Username)</label>
+                        <input type="text" id="login-username" required placeholder="เช่น Alex_Music" class="w-full px-3.5 py-2 text-xs rounded-xl bg-zinc-100 dark:bg-zinc-900 border border-transparent focus:border-zinc-400 focus:outline-none">
+                    </div>
+                    <div>
+                        <label class="block text-[11px] font-medium text-zinc-500 mb-1">อีเมล (Email)</label>
+                        <input type="email" id="login-email" required placeholder="alex@example.com" class="w-full px-3.5 py-2 text-xs rounded-xl bg-zinc-100 dark:bg-zinc-900 border border-transparent focus:border-zinc-400 focus:outline-none">
+                    </div>
+                    <button type="submit" class="w-full py-2.5 mt-2 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-medium hover:opacity-90 transition-opacity">
+                        เข้าสู่ระบบ / สร้างโปรไฟล์ทันที
+                    </button>
+                </form>
+            </div>
+
+            <!-- Logged In Profile View -->
+            <div id="auth-profile-view" class="hidden text-center">
+                <div class="w-16 h-16 rounded-full bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 flex items-center justify-center text-xl font-semibold mx-auto mb-3" id="profile-initial">
+                    A
+                </div>
+                <h4 class="text-sm font-medium" id="profile-name">Username</h4>
+                <p class="text-xs text-zinc-400 mb-5" id="profile-email">user@example.com</p>
+                
+                <div class="grid grid-cols-2 gap-2 mb-6 text-left">
+                    <div class="p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900/60 border border-zinc-200/50 dark:border-zinc-800/50">
+                        <p class="text-[10px] text-zinc-400">เพลงที่ถูกใจ</p>
+                        <p class="text-sm font-semibold mt-0.5" id="profile-fav-count">0 เพลง</p>
+                    </div>
+                    <div class="p-3 rounded-xl bg-zinc-50 dark:bg-zinc-900/60 border border-zinc-200/50 dark:border-zinc-800/50">
+                        <p class="text-[10px] text-zinc-400">ไฟล์ในเครื่อง</p>
+                        <p class="text-sm font-semibold mt-0.5" id="profile-local-count">0 ไฟล์</p>
+                    </div>
+                </div>
+
+                <button onclick="handleLogout()" class="w-full py-2 rounded-xl border border-rose-200 dark:border-rose-900/50 text-rose-600 dark:text-rose-400 text-xs font-medium hover:bg-rose-50 dark:hover:bg-rose-950/30 transition-colors">
+                    ออกจากระบบ
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- Custom Stream URL Modal -->
+    <div id="stream-modal" class="fixed inset-0 bg-black/40 backdrop-blur-xs z-50 hidden items-center justify-center p-4">
+        <div class="bg-surface-light dark:bg-surface-dark border border-zinc-200 dark:border-zinc-800 rounded-2xl max-w-sm w-full p-6 shadow-xl">
+            <div class="flex items-center justify-between mb-4">
+                <h3 class="text-base font-medium">เพิ่มสตรีมเพลงออนไลน์ (URL)</h3>
+                <button onclick="closeStreamUrlModal()" class="text-zinc-400 hover:text-zinc-900 dark:hover:text-white">
+                    <i data-lucide="x" class="w-4 h-4"></i>
+                </button>
+            </div>
+            <form onsubmit="handleAddStreamUrl(event)" class="space-y-3">
+                <div>
+                    <label class="block text-[11px] font-medium text-zinc-500 mb-1">ชื่อเพลง / สถานี</label>
+                    <input type="text" id="stream-title" required placeholder="เช่น Lofi Hip Hop Radio" class="w-full px-3.5 py-2 text-xs rounded-xl bg-zinc-100 dark:bg-zinc-900 focus:outline-none">
+                </div>
+                <div>
+                    <label class="block text-[11px] font-medium text-zinc-500 mb-1">ลิงก์ไฟล์เสียงโดยตรง (MP3, AAC, OGG, Stream URL)</label>
+                    <input type="url" id="stream-url" required placeholder="https://example.com/audio.mp3" class="w-full px-3.5 py-2 text-xs rounded-xl bg-zinc-100 dark:bg-zinc-900 focus:outline-none">
+                </div>
+                <button type="submit" class="w-full py-2.5 mt-2 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-medium hover:opacity-90">
+                    เพิ่มลงในรายการสตรีม
+                </button>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        // Initialize Lucide Icons
+        lucide.createIcons();
+
+        // --- State Management ---
+        const DEFAULT_COVER = "https://images.unsplash.com/photo-1614613535308-eb5fbd3d2c17?w=300&auto=format&fit=crop&q=60";
+        
+        // Curated royalty-free online streaming tracks (reliable public audio streams)
+        const INITIAL_STREAMS = [
+            {
+                id: 'stream-1',
+                title: 'Midnight Ambient Study',
+                artist: 'Aura Cloud Stream',
+                source: 'stream',
+                format: 'MP3 • 320kbps',
+                duration: '02:15',
+                url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3',
+                cover: 'https://images.unsplash.com/photo-1518609878373-06d740f60d8b?w=300&auto=format&fit=crop&q=60'
+            },
+            {
+                id: 'stream-2',
+                title: 'Minimalist Piano Reflections',
+                artist: 'Nordic Acoustic',
+                source: 'stream',
+                format: 'MP3 • High-Res',
+                duration: '03:42',
+                url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-2.mp3',
+                cover: 'https://images.unsplash.com/photo-1507838153414-b4b713384a76?w=300&auto=format&fit=crop&q=60'
+            },
+            {
+                id: 'stream-3',
+                title: 'Deep Focus Frequencies',
+                artist: 'Zenith Audio Lab',
+                source: 'stream',
+                format: 'OGG • Lossless Sim',
+                duration: '04:10',
+                url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-3.mp3',
+                cover: 'https://images.unsplash.com/photo-1459749411175-04bf5292ceea?w=300&auto=format&fit=crop&q=60'
+            },
+            {
+                id: 'stream-4',
+                title: 'Tokyo Rain & Chill',
+                artist: 'Lo-Fi Collective',
+                source: 'stream',
+                format: 'AAC • Stream',
+                duration: '03:18',
+                url: 'https://www.soundhelix.com/examples/mp3/SoundHelix-Song-8.mp3',
+                cover: 'https://images.unsplash.com/photo-1515694346937-94d85e41e6f0?w=300&auto=format&fit=crop&q=60'
+            }
+        ];
+
+        let state = {
+            tracks: [...INITIAL_STREAMS],
+            favorites: JSON.parse(localStorage.getItem('aura_favorites') || '[]'),
+            user: JSON.parse(localStorage.getItem('aura_user') || 'null'),
+            currentTab: 'all',
+            searchQuery: '',
+            currentTrackIndex: -1,
+            isPlaying: false,
+            isShuffle: false,
+            isRepeat: false,
+            volume: 0.8
+        };
+
+        // --- DOM Elements ---
+        const audio = document.getElementById('audio-player');
+        const fileInput = document.getElementById('local-file-input');
+        const trackListContainer = document.getElementById('track-list-container');
+        const emptyState = document.getElementById('empty-state');
+        const progressBar = document.getElementById('progress-bar');
+        const volumeBar = document.getElementById('volume-bar');
+        const searchInput = document.getElementById('search-input');
+
+        // --- Web Audio API Visualizer ---
+        let audioCtx, analyser, sourceNode, dataArray;
+        let isVisualizerInit = false;
+
+        function initVisualizer() {
+            if (isVisualizerInit) return;
+            try {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                audioCtx = new AudioContext();
+                analyser = audioCtx.createAnalyser();
+                sourceNode = audioCtx.createMediaElementSource(audio);
+                sourceNode.connect(analyser);
+                analyser.connect(audioCtx.destination);
+                analyser.fftSize = 64;
+                const bufferLength = analyser.frequencyBinCount;
+                dataArray = new Uint8Array(bufferLength);
+                isVisualizerInit = true;
+                drawVisualizer();
+            } catch (e) {
+                console.warn("Web Audio API CORS or init restriction:", e);
+            }
+        }
+
+        function drawVisualizer() {
+            requestAnimationFrame(drawVisualizer);
+            const canvas = document.getElementById('visualizer');
+            if (!canvas) return;
+            const ctx = canvas.getContext('2d');
+            const width = canvas.width = canvas.offsetWidth * 2;
+            const height = canvas.height = canvas.offsetHeight * 2;
+            ctx.clearRect(0, 0, width, height);
+
+            const isDark = document.documentElement.classList.contains('dark');
+            ctx.fillStyle = isDark ? 'rgba(255, 255, 255, 0.7)' : 'rgba(24, 24, 27, 0.7)';
+
+            const barCount = 24;
+            const gap = 4;
+            const barWidth = (width - (barCount - 1) * gap) / barCount;
+
+            if (analyser && state.isPlaying) {
+                analyser.getByteFrequencyData(dataArray);
+            }
+
+            for (let i = 0; i < barCount; i++) {
+                let value = 4;
+                if (state.isPlaying && dataArray) {
+                    value = Math.max(6, (dataArray[i] / 255) * height * 0.85);
+                } else if (state.isPlaying) {
+                    // Fallback subtle wave if CORS blocks analyser data
+                    value = 8 + Math.sin(Date.now() * 0.008 + i * 0.5) * 12;
+                }
+                const x = i * (barWidth + gap);
+                const y = (height - value) / 2;
+                ctx.beginPath();
+                ctx.roundRect(x, y, barWidth, value, 4);
+                ctx.fill();
+            }
+        }
+
+        // --- Initialization ---
+        function init() {
+            // Check system or saved theme
+            if (localStorage.getItem('aura_theme') === 'dark' || (!localStorage.getItem('aura_theme') && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
+                document.documentElement.classList.add('dark');
+                document.getElementById('theme-icon').setAttribute('data-lucide', 'sun');
+            }
+            audio.volume = state.volume;
+            updateUserUI();
+            renderTracks();
+            setupDragAndDrop();
+            lucide.createIcons();
+        }
+
+        // --- Toast Notification ---
+        function showToast(message, icon = 'info') {
+            const container = document.getElementById('toast-container');
+            const toast = document.createElement('div');
+            toast.className = 'flex items-center gap-2.5 px-4 py-2.5 rounded-xl bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 text-xs font-medium shadow-lg transform transition-all duration-300 translate-y-0 opacity-100';
+            toast.innerHTML = `<i data-lucide="${icon}" class="w-3.5 h-3.5 shrink-0"></i><span>${message}</span>`;
+            container.appendChild(toast);
+            lucide.createIcons();
+            setTimeout(() => {
+                toast.classList.add('opacity-0', '-translate-y-2');
+                setTimeout(() => toast.remove(), 300);
+            }, 3000);
+        }
+
+        // --- Theme Toggle ---
+        function toggleTheme() {
+            const html = document.documentElement;
+            const icon = document.getElementById('theme-icon');
+            if (html.classList.contains('dark')) {
+                html.classList.remove('dark');
+                localStorage.setItem('aura_theme', 'light');
+                icon.setAttribute('data-lucide', 'moon');
+            } else {
+                html.classList.add('dark');
+                localStorage.setItem('aura_theme', 'dark');
+                icon.setAttribute('data-lucide', 'sun');
+            }
+            lucide.createIcons();
+        }
+
+        // --- Local File Handling (Supports ALL Audio Formats) ---
+        function triggerFileUpload() {
+            fileInput.click();
+        }
+
+        fileInput.addEventListener('change', (e) => {
+            handleFiles(e.target.files);
+            fileInput.value = ''; // Reset input
+        });
+
+        function handleFiles(files) {
+            if (!files || files.length === 0) return;
+            let addedCount = 0;
+
+            Array.from(files).forEach((file) => {
+                // Accept audio MIME types or common audio extensions (including FLAC, OGG, WAV, M4A, OPUS, AIFF)
+                const isAudio = file.type.startsWith('audio/') || /\.(mp3|wav|flac|ogg|aac|m4a|wma|aiff|opus|alac)$/i.test(file.name);
+                
+                if (isAudio) {
+                    const objectUrl = URL.createObjectURL(file);
+                    const ext = file.name.split('.').pop().toUpperCase();
+                    const cleanName = file.name.replace(/\.[^/.]+$/, "");
+                    
+                    const newTrack = {
+                        id: 'local-' + Date.now() + '-' + Math.random().toString(36).substr(2, 5),
+                        title: cleanName,
+                        artist: 'ไฟล์ในเครื่อง (Local)',
+                        source: 'local',
+                        format: `${ext} • ${(file.size / (1024 * 1024)).toFixed(1)} MB`,
+                        duration: '--:--',
+                        url: objectUrl,
+                        cover: DEFAULT_COVER,
+                        fileObj: file
+                    };
+
+                    // Extract real duration asynchronously
+                    const tempAudio = new Audio(objectUrl);
+                    tempAudio.addEventListener('loadedmetadata', () => {
+                        newTrack.duration = formatTime(tempAudio.duration);
+                        renderTracks();
+                    });
+
+                    state.tracks.unshift(newTrack);
+                    addedCount++;
+                }
+            });
+
+            if (addedCount > 0) {
+                showToast(`เพิ่มไฟล์เพลง ${addedCount} รายการเรียบร้อยแล้ว`, 'check-circle');
+                switchTab('local');
+                if (state.currentTrackIndex === -1) {
+                    playTrackById(state.tracks[0].id);
+                }
+            } else {
+                showToast('ไม่พบไฟล์เสียงที่รองรับ กรุณาเลือกไฟล์เพลง', 'alert-circle');
+            }
+        }
+
+        // Drag & Drop Support
+        function setupDragAndDrop() {
+            const dropZone = document.getElementById('drop-zone');
+            const overlay = document.getElementById('drag-overlay');
+
+            ['dragenter', 'dragover'].forEach(evt => {
+                dropZone.addEventListener(evt, (e) => {
+                    e.preventDefault();
+                    overlay.classList.remove('hidden');
+                });
+            });
+
+            ['dragleave', 'drop'].forEach(evt => {
+                overlay.addEventListener(evt, (e) => {
+                    e.preventDefault();
+                    overlay.classList.add('hidden');
+                });
+            });
+
+            overlay.addEventListener('drop', (e) => {
+                const files = e.dataTransfer.files;
+                handleFiles(files);
+            });
+        }
+
+        // --- Navigation & Filtering ---
+        function switchTab(tab) {
+            state.currentTab = tab;
+            
+            // Update Desktop Nav UI
+            document.querySelectorAll('.nav-btn').forEach(btn => {
+                btn.className = 'nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium text-zinc-500 hover:text-zinc-900 dark:text-zinc-400 dark:hover:text-white hover:bg-zinc-50 dark:hover:bg-zinc-800/40 transition-all';
+            });
+            const activeDesktop = document.getElementById(`nav-${tab}`);
+            if (activeDesktop) {
+                activeDesktop.className = 'nav-btn w-full flex items-center gap-3 px-3.5 py-2.5 rounded-xl text-sm font-medium bg-zinc-100 dark:bg-zinc-800/80 text-zinc-900 dark:text-white transition-all';
+            }
+
+            // Update Mobile Nav UI
+            document.querySelectorAll('.mob-nav-btn').forEach(btn => {
+                btn.className = 'mob-nav-btn px-3 py-1 rounded-full text-xs font-medium bg-zinc-100 text-zinc-600 dark:bg-zinc-800 dark:text-zinc-400 whitespace-nowrap';
+            });
+            const activeMob = document.getElementById(`mob-nav-${tab}`);
+            if (activeMob) {
+                activeMob.className = 'mob-nav-btn px-3 py-1 rounded-full text-xs font-medium bg-zinc-900 text-white dark:bg-white dark:text-zinc-900 whitespace-nowrap';
+            }
+
+            // Update Titles
+            const titles = {
+                all: { sub: 'Library', title: 'คลังเพลงทั้งหมด' },
+                stream: { sub: 'Online Cloud', title: 'สตรีมมิ่งออนไลน์' },
+                local: { sub: 'Device Storage', title: 'ไฟล์เพลงในเครื่อง' },
+                favorites: { sub: 'Collection', title: 'เพลงที่ถูกใจ' }
+            };
+            document.getElementById('section-subtitle').textContent = titles[tab].sub;
+            document.getElementById('section-title').textContent = titles[tab].title;
+
+            renderTracks();
+        }
+
+        searchInput.addEventListener('input', (e) => {
+            state.searchQuery = e.target.value.toLowerCase().trim();
+            renderTracks();
+        });
+
+        function getFilteredTracks() {
+            return state.tracks.filter(track => {
+                // Tab filter
+                if (state.currentTab === 'stream' && track.source !== 'stream') return false;
+                if (state.currentTab === 'local' && track.source !== 'local') return false;
+                if (state.currentTab === 'favorites' && !state.favorites.includes(track.id)) return false;
+
+                // Search filter
+                if (state.searchQuery) {
+                    const matchTitle = track.title.toLowerCase().includes(state.searchQuery);
+                    const matchArtist = track.artist.toLowerCase().includes(state.searchQuery);
+                    const matchFormat = track.format.toLowerCase().includes(state.searchQuery);
+                    return matchTitle || matchArtist || matchFormat;
+                }
+                return true;
+            });
+        }
+
+        // --- Render Track List ---
+        function renderTracks() {
+            const filtered = getFilteredTracks();
+            document.getElementById('track-count').textContent = `${filtered.length} เพลง`;
+            trackListContainer.innerHTML = '';
+
+            if (filtered.length === 0) {
+                emptyState.classList.remove('hidden');
+                return;
+            }
+            emptyState.classList.add('hidden');
+
+            const currentTrack = state.tracks[state.currentTrackIndex];
+
+            filtered.forEach((track, index) => {
+                const isCurrent = currentTrack && currentTrack.id === track.id;
+                const isFav = state.favorites.includes(track.id);
+                
+                const row = document.createElement('div');
+                row.className = `grid grid-cols-12 gap-2 px-4 py-3 items-center hover:bg-zinc-50 dark:hover:bg-zinc-800/40 transition-colors cursor-pointer group ${isCurrent ? 'bg-zinc-100/70 dark:bg-zinc-800/60' : ''}`;
+                row.onclick = (e) => {
+                    if (e.target.closest('.fav-btn')) return;
+                    playTrackById(track.id);
+                };
+
+                row.innerHTML = `
+                    <div class="col-span-1 text-center text-xs font-mono ${isCurrent ? 'text-zinc-900 dark:text-white font-semibold' : 'text-zinc-400'}">
+                        ${isCurrent && state.isPlaying ? '<i data-lucide="volume-2" class="w-3.5 h-3.5 mx-auto animate-pulse"></i>' : (index + 1)}
+                    </div>
+                    <div class="col-span-6 sm:col-span-5 flex items-center gap-3 min-w-0">
+                        <img src="${track.cover}" alt="Cover" class="w-9 h-9 rounded-lg object-cover shrink-0 bg-zinc-200 dark:bg-zinc-800">
+                        <div class="min-w-0">
+                            <p class="text-xs sm:text-sm font-medium truncate ${isCurrent ? 'text-zinc-900 dark:text-white' : ''}">${track.title}</p>
+                            <p class="text-[11px] text-zinc-400 truncate">${track.artist}</p>
+                        </div>
+                    </div>
+                    <div class="col-span-3 hidden sm:flex items-center gap-1.5">
+                        <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-medium ${track.source === 'local' ? 'bg-emerald-50 text-emerald-700 dark:bg-emerald-950/50 dark:text-emerald-400' : 'bg-sky-50 text-sky-700 dark:bg-sky-950/50 dark:text-sky-400'}">
+                            <i data-lucide="${track.source === 'local' ? 'hard-drive' : 'cloud'}" class="w-2.5 h-2.5"></i>
+                            ${track.source === 'local' ? 'Local' : 'Stream'}
+                        </span>
+                        <span class="text-[10px] text-zinc-400 font-mono truncate">${track.format}</span>
+                    </div>
+                    <div class="col-span-3 sm:col-span-2 text-right text-xs font-mono text-zinc-400">
+                        ${track.duration}
+                    </div>
+                    <div class="col-span-2 sm:col-span-1 text-center">
+                        <button onclick="toggleFavorite('${track.id}')" class="fav-btn p-1.5 rounded-full hover:bg-zinc-200/50 dark:hover:bg-zinc-700/50 transition-colors ${isFav ? 'text-rose-500' : 'text-zinc-300 dark:text-zinc-600 hover:text-zinc-500'}">
+                            <i data-lucide="heart" class="w-3.5 h-3.5 ${isFav ? 'fill-current' : ''}"></i>
+                        </button>
+                    </div>
+                `;
+                trackListContainer.appendChild(row);
+            });
+
+            lucide.createIcons();
+        }
+
+        // --- Audio Playback Controls ---
+        function playTrackById(id) {
+            const idx = state.tracks.findIndex(t => t.id === id);
+            if (idx === -1) return;
+            
+            state.currentTrackIndex = idx;
+            const track = state.tracks[idx];
+
+            // Init Web Audio API on first user gesture
+            if (!isVisualizerInit) initVisualizer();
+            if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+
+            audio.src = track.url;
+            audio.play().then(() => {
+                state.isPlaying = true;
+                updatePlayerUI();
+                renderTracks();
+            }).catch(err => {
+                console.error("Playback error:", err);
+                showToast('ไม่สามารถเล่นไฟล์นี้ได้ กรุณาตรวจสอบรูปแบบไฟล์หรือลิงก์', 'alert-triangle');
+            });
+        }
+
+        function playAllFiltered() {
+            const filtered = getFilteredTracks();
+            if (filtered.length > 0) {
+                playTrackById(filtered[0].id);
+            }
+        }
+
+        function togglePlay() {
+            if (state.currentTrackIndex === -1 && state.tracks.length > 0) {
+                playTrackById(state.tracks[0].id);
+                return;
+            }
+            if (audio.paused) {
+                if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+                audio.play();
+                state.isPlaying = true;
+            } else {
+                audio.pause();
+                state.isPlaying = false;
+            }
+            updatePlayerUI();
+            renderTracks();
+        }
+
+        function nextTrack() {
+            if (state.tracks.length === 0) return;
+            if (state.isShuffle) {
+                const randIdx = Math.floor(Math.random() * state.tracks.length);
+                playTrackById(state.tracks[randIdx].id);
+            } else {
+                const nextIdx = (state.currentTrackIndex + 1) % state.tracks.length;
+                playTrackById(state.tracks[nextIdx].id);
+            }
+        }
+
+        function prevTrack() {
+            if (state.tracks.length === 0) return;
+            if (audio.currentTime > 3) {
+                audio.currentTime = 0;
+                return;
+            }
+            const prevIdx = (state.currentTrackIndex - 1 + state.tracks.length) % state.tracks.length;
+            playTrackById(state.tracks[prevIdx].id);
+        }
+
+        function toggleShuffle() {
+            state.isShuffle = !state.isShuffle;
+            const btn = document.getElementById('btn-shuffle');
+            btn.classList.toggle('text-zinc-900', state.isShuffle);
+            btn.classList.toggle('dark:text-white', state.isShuffle);
+            btn.classList.toggle('text-zinc-400', !state.isShuffle);
+            showToast(state.isShuffle ? 'เปิดโหมดสุ่มเพลง' : 'ปิดโหมดสุ่มเพลง', 'shuffle');
+        }
+
+        function toggleRepeat() {
+            state.isRepeat = !state.isRepeat;
+            audio.loop = state.isRepeat;
+            const btn = document.getElementById('btn-repeat');
+            btn.classList.toggle('text-zinc-900', state.isRepeat);
+            btn.classList.toggle('dark:text-white', state.isRepeat);
+            btn.classList.toggle('text-zinc-400', !state.isRepeat);
+            showToast(state.isRepeat ? 'เปิดโหมดเล่นซ้ำเพลงเดิม' : 'ปิดโหมดเล่นซ้ำ', 'repeat');
+        }
+
+        // Audio Events
+        audio.addEventListener('timeupdate', () => {
+            if (!isNaN(audio.duration)) {
+                const percent = (audio.currentTime / audio.duration) * 100;
+                progressBar.value = percent;
+                document.getElementById('time-current').textContent = formatTime(audio.currentTime);
+                document.getElementById('time-total').textContent = formatTime(audio.duration);
+            }
+        });
+
+        audio.addEventListener('ended', () => {
+            if (!state.isRepeat) {
+                nextTrack();
+            }
+        });
+
+        progressBar.addEventListener('input', (e) => {
+            if (!isNaN(audio.duration)) {
+                const seekTime = (e.target.value / 100) * audio.duration;
+                audio.currentTime = seekTime;
+            }
+        });
+
+        // Volume Controls
+        volumeBar.addEventListener('input', (e) => {
+            state.volume = e.target.value / 100;
+            audio.volume = state.volume;
+            updateVolumeIcon();
+        });
+
+        function toggleMute() {
+            audio.muted = !audio.muted;
+            updateVolumeIcon();
+        }
+
+        function updateVolumeIcon() {
+            const icon = document.getElementById('volume-icon');
+            if (audio.muted || audio.volume === 0) {
+                icon.setAttribute('data-lucide', 'volume-x');
+            } else if (audio.volume < 0.5) {
+                icon.setAttribute('data-lucide', 'volume-1');
+            } else {
+                icon.setAttribute('data-lucide', 'volume-2');
+            }
+            lucide.createIcons();
+        }
+
+        function updatePlayerUI() {
+            const track = state.tracks[state.currentTrackIndex];
+            if (!track) return;
+
+            // Bottom Player
+            document.getElementById('player-title').textContent = track.title;
+            document.getElementById('player-artist').textContent = track.artist;
+            document.getElementById('player-cover').src = track.cover;
+
+            // Top Banner
+            document.getElementById('banner-title').textContent = track.title;
+            document.getElementById('banner-art').src = track.cover;
+            document.getElementById('banner-badge').textContent = state.isPlaying ? 'กำลังเล่น' : 'หยุดชั่วคราว';
+            document.getElementById('banner-format').textContent = track.format;
+
+            // Spinning Vinyl Effect
+            const coverEl = document.getElementById('player-cover');
+            if (state.isPlaying) {
+                coverEl.classList.remove('paused-animation');
+            } else {
+                coverEl.classList.add('paused-animation');
+            }
+
+            // Play/Pause Icon
+            const playIcon = document.getElementById('play-pause-icon');
+            playIcon.setAttribute('data-lucide', state.isPlaying ? 'pause' : 'play');
+            if (!state.isPlaying) playIcon.classList.add('ml-0.5');
+            else playIcon.classList.remove('ml-0.5');
+
+            // Favorite Heart State
+            updatePlayerFavIcon();
+            lucide.createIcons();
+        }
+
+        function formatTime(seconds) {
+            if (isNaN(seconds) || !isFinite(seconds)) return '0:00';
+            const mins = Math.floor(seconds / 60);
+            const secs = Math.floor(seconds % 60);
+            return `${mins}:${secs < 10 ? '0' : ''}${secs}`;
+        }
+
+        // --- Favorites System ---
+        function toggleFavorite(id) {
+            if (!state.user) {
+                showToast('กรุณาเข้าสู่ระบบเพื่อบันทึกเพลงที่ถูกใจ', 'user');
+                openAuthModal();
+                return;
+            }
+            const idx = state.favorites.indexOf(id);
+            if (idx === -1) {
+                state.favorites.push(id);
+                showToast('เพิ่มในรายการเพลงที่ถูกใจแล้ว', 'heart');
+            } else {
+                state.favorites.splice(idx, 1);
+            }
+            localStorage.setItem('aura_favorites', JSON.stringify(state.favorites));
+            updatePlayerFavIcon();
+            renderTracks();
+        }
+
+        function toggleCurrentFavorite() {
+            const track = state.tracks[state.currentTrackIndex];
+            if (track) toggleFavorite(track.id);
+        }
+
+        function updatePlayerFavIcon() {
+            const track = state.tracks[state.currentTrackIndex];
+            const btn = document.getElementById('player-fav-btn');
+            if (!track) return;
+            const isFav = state.favorites.includes(track.id);
+            btn.className = `p-1.5 transition-colors hidden sm:block ${isFav ? 'text-rose-500' : 'text-zinc-400 hover:text-rose-500'}`;
+            btn.innerHTML = `<i data-lucide="heart" class="w-4 h-4 ${isFav ? 'fill-current' : ''}"></i>`;
+            lucide.createIcons();
+        }
+
+        // --- Custom Online Stream URL Modal ---
+        function openStreamUrlModal() {
+            document.getElementById('stream-modal').classList.remove('hidden');
+            document.getElementById('stream-modal').classList.add('flex');
+        }
+
+        function closeStreamUrlModal() {
+            document.getElementById('stream-modal').classList.add('hidden');
+            document.getElementById('stream-modal').classList.remove('flex');
+        }
+
+        function handleAddStreamUrl(e) {
+            e.preventDefault();
+            const title = document.getElementById('stream-title').value.trim();
+            const url = document.getElementById('stream-url').value.trim();
+
+            const newStream = {
+                id: 'stream-' + Date.now(),
+                title: title,
+                artist: 'Custom Web Stream',
+                source: 'stream',
+                format: 'WEB • URL',
+                duration: 'LIVE / STREAM',
+                url: url,
+                cover: DEFAULT_COVER
+            };
+
+            state.tracks.unshift(newStream);
+            closeStreamUrlModal();
+            document.getElementById('stream-title').value = '';
+            document.getElementById('stream-url').value = '';
+            
+            showToast('เพิ่มลิงก์สตรีมมิ่งเรียบร้อยแล้ว', 'radio');
+            switchTab('stream');
+            playTrackById(newStream.id);
+        }
+
+        // --- User Authentication System ---
+        function openAuthModal() {
+            const modal = document.getElementById('auth-modal');
+            modal.classList.remove('hidden');
+            modal.classList.add('flex');
+            updateAuthModalContent();
+        }
+
+        function closeAuthModal() {
+            const modal = document.getElementById('auth-modal');
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+
+        function handleLogin(e) {
+            e.preventDefault();
+            const username = document.getElementById('login-username').value.trim();
+            const email = document.getElementById('login-email').value.trim();
+            
+            state.user = { username, email };
+            localStorage.setItem('aura_user', JSON.stringify(state.user));
+            
+            updateUserUI();
+            updateAuthModalContent();
+            showToast(`ยินดีต้อนรับคุณ ${username}`, 'check-circle');
+        }
+
+        function handleLogout() {
+            state.user = null;
+            localStorage.removeItem('aura_user');
+            updateUserUI();
+            updateAuthModalContent();
+            showToast('ออกจากระบบแล้ว', 'log-out');
+        }
+
+        function updateUserUI() {
+            const avatarEl = document.getElementById('user-avatar');
+            const nameEl = document.getElementById('user-display-name');
+            const statusEl = document.getElementById('user-status-text');
+
+            if (state.user) {
+                avatarEl.innerHTML = `<span class="text-zinc-900 dark:text-white">${state.user.username.charAt(0).toUpperCase()}</span>`;
+                nameEl.textContent = state.user.username;
+                statusEl.textContent = 'สมาชิก Aura • ซิงค์แล้ว';
+            } else {
+                avatarEl.innerHTML = `<i data-lucide="user" class="w-4 h-4 text-zinc-500"></i>`;
+                nameEl.textContent = 'ผู้เยี่ยมชม (Guest)';
+                statusEl.textContent = 'คลิกเพื่อเข้าสู่ระบบ';
+                lucide.createIcons();
+            }
+        }
+
+        function updateAuthModalContent() {
+            const formView = document.getElementById('auth-form-view');
+            const profileView = document.getElementById('auth-profile-view');
+
+            if (state.user) {
+                formView.classList.add('hidden');
+                profileView.classList.remove('hidden');
+                document.getElementById('profile-initial').textContent = state.user.username.charAt(0).toUpperCase();
+                document.getElementById('profile-name').textContent = state.user.username;
+                document.getElementById('profile-email').textContent = state.user.email;
+                document.getElementById('profile-fav-count').textContent = `${state.favorites.length} เพลง`;
+                const localCount = state.tracks.filter(t => t.source === 'local').length;
+                document.getElementById('profile-local-count').textContent = `${localCount} ไฟล์`;
+            } else {
+                formView.classList.remove('hidden');
+                profileView.classList.add('hidden');
+            }
+        }
+
+        // Start App
+        init();
+    </script>
+</body>
+</html>

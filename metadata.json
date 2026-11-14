@@ -1,0 +1,6 @@
+{
+  "name": "Aura Audio — Minimalist Music Player",
+  "description": "แอพฟังเพลงดีไซน์มินิมอล รองรับไฟล์เพลงในเครื่องทุกรูปแบบ สตรีมเพลงออนไลน์ ระบบบัญชีผู้ใช้ และอีควอไลเซอร์เสียง",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
