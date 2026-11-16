@@ -7,13 +7,18 @@ import type {
   HddBrowseResult,
   HddHostInfo,
   HddRootOption,
+  LanHostInfo,
+  LanSharedTrackMeta,
+  LanSignalPayload,
   MountedHddFolder,
+  NetworkInfoResponse,
   Track,
   UserAccount,
   UserPreferences,
 } from '../types/music';
 
 const AUTH_TOKEN_KEY = 'aura_auth_token_v1';
+const CACHED_USER_KEY = 'aura_cached_user_v1';
 const SERVER_BASE_URL_KEY = 'aura_server_base_url_v1';
 
 export const DEFAULT_REMOTE_SERVER_URL =
@@ -95,6 +100,7 @@ function hydrateTrackUrls(track: Track): Track {
     ...track,
     url: resolveTrackPlayableUrl(track.url),
     ...(track.streamUrl ? { streamUrl: resolveTrackPlayableUrl(track.streamUrl) } : {}),
+    ...(track.coverDataUrl ? { coverDataUrl: resolveTrackPlayableUrl(track.coverDataUrl) } : {}),
   };
 }
 
@@ -168,6 +174,28 @@ export function setAuthToken(token: string | null): void {
   }
 }
 
+function getCachedUser(): UserAccount | null {
+  try {
+    const raw = localStorage.getItem(CACHED_USER_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw) as UserAccount;
+  } catch {
+    return null;
+  }
+}
+
+function setCachedUser(user: UserAccount | null): void {
+  try {
+    if (user) {
+      localStorage.setItem(CACHED_USER_KEY, JSON.stringify(user));
+    } else {
+      localStorage.removeItem(CACHED_USER_KEY);
+    }
+  } catch {
+    // ignore
+  }
+}
+
 function authHeaders(extra: Record<string, string> = {}): Record<string, string> {
   const token = getAuthToken();
   return token ? { ...extra, Authorization: `Bearer ${token}` } : extra;
@@ -193,6 +221,7 @@ export async function apiLogin(
     throw new Error(data.error || 'เข้าสู่ระบบไม่สำเร็จ');
   }
   setAuthToken(data.token);
+  setCachedUser(data.user);
   return { user: data.user, token: data.token };
 }
 
@@ -215,30 +244,43 @@ export async function apiRegister(
     throw new Error(data.error || 'สมัครสมาชิกไม่สำเร็จ');
   }
   setAuthToken(data.token);
+  setCachedUser(data.user);
   return { user: data.user, token: data.token };
 }
 
 export async function apiFetchMe(): Promise<UserAccount | null> {
   const token = getAuthToken();
-  if (!token) return null;
+  if (!token) {
+    setCachedUser(null);
+    return null;
+  }
   try {
     const res = await fetch(apiUrl('/api/auth/me'), {
       headers: authHeaders(),
     });
-    if (!res.ok) {
+    if (res.status === 401 || res.status === 403) {
       setAuthToken(null);
+      setCachedUser(null);
       return null;
     }
+    if (!res.ok) {
+      return getCachedUser();
+    }
     const data = (await res.json()) as { user?: UserAccount };
-    return data.user || null;
+    if (data.user) {
+      setCachedUser(data.user);
+      return data.user;
+    }
+    return getCachedUser();
   } catch {
-    return null;
+    return getCachedUser();
   }
 }
 
 export async function apiLogout(): Promise<void> {
   const token = getAuthToken();
   setAuthToken(null);
+  setCachedUser(null);
   if (!token) return;
   try {
     await fetch(apiUrl('/api/auth/logout'), {
@@ -277,13 +319,40 @@ export async function apiSaveUserPrefs(prefs: UserPreferences): Promise<void> {
 
 // --- Shared Multi-Device Stream Catalog ---
 
-export async function fetchServerHddStreamsSafe(): Promise<{ ok: boolean; tracks: Track[] }> {
+export async function fetchServerHddStreamsSafe(knownVersion?: string): Promise<{
+  ok: boolean;
+  notModified?: boolean;
+  version?: string;
+  tracks: Track[];
+}> {
   try {
-    const res = await fetch(apiUrl('/api/streams'));
+    const cleanVersion = knownVersion?.trim() || '';
+    const endpoint = cleanVersion
+      ? apiUrl(`/api/streams?knownVersion=${encodeURIComponent(cleanVersion)}`)
+      : apiUrl('/api/streams');
+    const res = await fetch(endpoint, {
+      cache: 'no-cache',
+      ...(cleanVersion ? { headers: { 'If-None-Match': `"${cleanVersion}"` } } : {}),
+    });
+    if (res.status === 304) {
+      return {
+        ok: true,
+        notModified: true,
+        version: cleanVersion,
+        tracks: [],
+      };
+    }
     if (!res.ok) return { ok: false, tracks: [] };
-    const data = (await res.json()) as { tracks?: Track[] };
+    const data = (await res.json()) as { version?: string; tracks?: Track[] };
+    const headerEtag = res.headers
+      .get('etag')
+      ?.trim()
+      .replace(/^W\//i, '')
+      .replace(/^"+|"+$/g, '');
     return {
       ok: true,
+      notModified: false,
+      version: data.version || headerEtag || '',
       tracks: Array.isArray(data.tracks) ? data.tracks.map(hydrateTrackUrls) : [],
     };
   } catch {
@@ -367,11 +436,22 @@ export function saveLocalDeviceName(name: string): string {
 }
 
 export interface StreamEventPayload {
-  type?: 'connected' | 'library-updated' | 'clients-changed' | 'devices-changed' | 'cast-command';
+  type?:
+    | 'connected'
+    | 'ping'
+    | 'library-updated'
+    | 'clients-changed'
+    | 'devices-changed'
+    | 'cast-command'
+    | 'lan-hosts-changed'
+    | 'lan-signal';
   reason?: string;
+  catalogVersion?: string;
   connectedClients?: number;
   devices?: ConnectedCastDevice[];
+  lanHosts?: LanHostInfo[];
   command?: CastCommandPayload;
+  signal?: LanSignalPayload;
   timestamp?: number;
 }
 
@@ -383,10 +463,12 @@ export function subscribeToStreamEvents(
     isAdmin?: boolean;
     onDevicesChange?: (devices: ConnectedCastDevice[]) => void;
     onCastCommand?: (command: CastCommandPayload) => void;
+    onLanHostsChange?: (hosts: LanHostInfo[]) => void;
+    onLanSignal?: (signal: LanSignalPayload) => void;
   }
 ): () => void {
   if (typeof EventSource === 'undefined') return () => {};
-  onStatusEvent?.('connecting');
+
   const params = new URLSearchParams();
   if (options?.device) {
     params.set('deviceId', options.device.deviceId);
@@ -397,41 +479,123 @@ export function subscribeToStreamEvents(
     params.set('isAdmin', '1');
   }
   const query = params.toString();
-  const source = new EventSource(apiUrl(`/api/streams/events${query ? `?${query}` : ''}`));
+  const streamUrl = apiUrl(`/api/streams/events${query ? `?${query}` : ''}`);
+
+  let disposed = false;
+  let source: EventSource | null = null;
   let hasOpenedOnce = false;
-  source.onopen = () => {
-    onStatusEvent?.('connected');
+  let needsSyncOnConnect = false;
+  let lastActivityAt = Date.now();
+  let closedSince = 0;
+
+  const connect = () => {
+    if (disposed) return;
+    if (source) {
+      try {
+        source.close();
+      } catch {
+        // ignore
+      }
+      source = null;
+    }
+
     if (hasOpenedOnce) {
-      onLibraryUpdate({ type: 'connected' });
+      needsSyncOnConnect = true;
     }
-    hasOpenedOnce = true;
-  };
-  source.onerror = () => {
-    onStatusEvent?.('reconnecting');
-  };
-  source.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data) as StreamEventPayload;
-      if (Array.isArray(data.devices)) {
-        options?.onDevicesChange?.(data.devices);
+    onStatusEvent?.(hasOpenedOnce ? 'reconnecting' : 'connecting');
+    const es = new EventSource(streamUrl);
+    source = es;
+
+    es.onopen = () => {
+      if (disposed) return;
+      lastActivityAt = Date.now();
+      closedSince = 0;
+      onStatusEvent?.('connected');
+      hasOpenedOnce = true;
+    };
+
+    es.onerror = () => {
+      if (disposed) return;
+      if (hasOpenedOnce) {
+        needsSyncOnConnect = true;
       }
-      if (data.type === 'connected' || data.type === 'clients-changed' || data.type === 'devices-changed') {
-        onStatusEvent?.('connected', data);
-      } else if (data.type === 'library-updated') {
-        onStatusEvent?.('connected', data);
-        onLibraryUpdate(data);
-      } else if (data.type === 'cast-command' && data.command) {
-        options?.onCastCommand?.({
-          ...data.command,
-          ...(data.command.track ? { track: hydrateTrackUrls(data.command.track) } : {}),
-        });
+      if (es.readyState === EventSource.CLOSED && !closedSince) {
+        closedSince = Date.now();
       }
-    } catch {
-      // ignore
+      onStatusEvent?.('reconnecting');
+    };
+
+    es.onmessage = (event) => {
+      if (disposed) return;
+      lastActivityAt = Date.now();
+      closedSince = 0;
+      try {
+        const data = JSON.parse(event.data) as StreamEventPayload;
+        if (data.type === 'ping') {
+          onStatusEvent?.('connected');
+          return;
+        }
+        if (Array.isArray(data.devices)) {
+          options?.onDevicesChange?.(data.devices);
+        }
+        if (Array.isArray(data.lanHosts)) {
+          options?.onLanHostsChange?.(data.lanHosts);
+        }
+        if (data.type === 'connected') {
+          onStatusEvent?.('connected', data);
+          if (needsSyncOnConnect) {
+            needsSyncOnConnect = false;
+            onLibraryUpdate(data);
+          }
+        } else if (
+          data.type === 'clients-changed' ||
+          data.type === 'devices-changed' ||
+          data.type === 'lan-hosts-changed'
+        ) {
+          onStatusEvent?.('connected', data);
+        } else if (data.type === 'library-updated') {
+          onStatusEvent?.('connected', data);
+          onLibraryUpdate(data);
+        } else if (data.type === 'cast-command' && data.command) {
+          options?.onCastCommand?.({
+            ...data.command,
+            ...(data.command.track ? { track: hydrateTrackUrls(data.command.track) } : {}),
+          });
+        } else if (data.type === 'lan-signal' && data.signal) {
+          if (!options?.device || data.signal.targetDeviceId === options.device.deviceId) {
+            options?.onLanSignal?.(data.signal);
+          }
+        }
+      } catch {
+        // ignore malformed event
+      }
+    };
+  };
+
+  connect();
+
+  const watchdog = window.setInterval(() => {
+    if (disposed) return;
+    const now = Date.now();
+    const staleMs = now - lastActivityAt;
+    const isClosedTooLong =
+      source?.readyState === EventSource.CLOSED && closedSince > 0 && now - closedSince > 3000;
+    if (!source || staleMs > 32000 || isClosedTooLong) {
+      connect();
     }
-  };
+  }, 8000);
+
   return () => {
-    source.close();
+    disposed = true;
+    window.clearInterval(watchdog);
+    if (source) {
+      try {
+        source.close();
+      } catch {
+        // ignore
+      }
+      source = null;
+    }
   };
 }
 
@@ -487,6 +651,97 @@ export async function sendCastCommand(payload: {
   }
 }
 
+// --- Local Network (LAN) Discovery & P2P Signaling API ---
+
+export async function fetchNetworkInfo(): Promise<NetworkInfoResponse | null> {
+  try {
+    const res = await fetch(apiUrl('/api/network/info'));
+    if (!res.ok) return null;
+    return (await res.json()) as NetworkInfoResponse;
+  } catch {
+    return null;
+  }
+}
+
+export async function fetchLanHosts(): Promise<LanHostInfo[]> {
+  try {
+    const res = await fetch(apiUrl('/api/lan/hosts'));
+    if (!res.ok) return [];
+    const data = (await res.json()) as { hosts?: LanHostInfo[] };
+    return Array.isArray(data.hosts) ? data.hosts : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function registerLanHost(payload: {
+  deviceId: string;
+  deviceName: string;
+  deviceType: CastDeviceType;
+  tracks: LanSharedTrackMeta[];
+}): Promise<LanHostInfo[]> {
+  const res = await fetch(apiUrl('/api/lan/host/register'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(err.error || 'ไม่สามารถเปิดแชร์เพลงในวง Local Network ได้');
+  }
+  const data = (await res.json()) as { hosts?: LanHostInfo[] };
+  return Array.isArray(data.hosts) ? data.hosts : [];
+}
+
+export async function heartbeatLanHost(
+  deviceId: string
+): Promise<{ ok: boolean; reregisterRequired?: boolean }> {
+  try {
+    const res = await fetch(apiUrl('/api/lan/host/heartbeat'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId }),
+    });
+    if (!res.ok) return { ok: false };
+    return (await res.json()) as { ok: boolean; reregisterRequired?: boolean };
+  } catch {
+    return { ok: false };
+  }
+}
+
+export async function unregisterLanHost(deviceId: string): Promise<LanHostInfo[]> {
+  try {
+    const res = await fetch(apiUrl('/api/lan/host/unregister'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deviceId }),
+    });
+    if (!res.ok) return [];
+    const data = (await res.json()) as { hosts?: LanHostInfo[] };
+    return Array.isArray(data.hosts) ? data.hosts : [];
+  } catch {
+    return [];
+  }
+}
+
+export async function sendLanSignal(payload: {
+  fromDeviceId: string;
+  fromDeviceName: string;
+  targetDeviceId: string;
+  signalType: 'offer' | 'answer' | 'ice' | 'reject';
+  data: unknown;
+}): Promise<void> {
+  const res = await fetch(apiUrl('/api/lan/signal'), {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const err = (await res.json().catch(() => ({}))) as { error?: string };
+    throw new Error(err.error || 'ส่งสัญญาณ Local Network ไม่สำเร็จ');
+  }
+}
+
 export async function fetchAdminStatus(): Promise<AdminOperationalStatus | null> {
   if (!getAuthToken()) return null;
   try {
@@ -515,6 +770,62 @@ export async function publishTrackToServerStream(
   filename: string
 ): Promise<Track> {
   const folder = track.folderName || track.syncedFolder;
+  const CHUNK_THRESHOLD_BYTES = 16 * 1024 * 1024;
+  const CHUNK_SIZE_BYTES = 8 * 1024 * 1024;
+
+  if (blob.size > CHUNK_THRESHOLD_BYTES) {
+    const initRes = await fetch(apiUrl('/api/streams/upload-init'), {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({
+        filename,
+        title: track.title,
+        artist: track.artist,
+        album: track.album,
+        genre: track.genre,
+        folderName: folder,
+        durationSec: track.durationSec,
+        totalSize: blob.size,
+        clientTrackId: track.id,
+      }),
+    });
+    if (!initRes.ok) {
+      const err = (await initRes.json().catch(() => ({}))) as { error?: string };
+      throw new Error(err.error || 'ไม่สามารถเริ่มอัปโหลดไฟล์เสียงขนาดใหญ่ได้');
+    }
+    const { uploadId } = (await initRes.json()) as { uploadId: string };
+
+    let chunkIndex = 0;
+    for (let offset = 0; offset < blob.size; offset += CHUNK_SIZE_BYTES) {
+      const slice = blob.slice(offset, Math.min(offset + CHUNK_SIZE_BYTES, blob.size));
+      const chunkRes = await fetch(apiUrl('/api/streams/upload-chunk'), {
+        method: 'POST',
+        headers: authHeaders({
+          'Content-Type': 'application/octet-stream',
+          'x-upload-id': uploadId,
+          'x-chunk-index': String(chunkIndex++),
+        }),
+        body: slice,
+      });
+      if (!chunkRes.ok) {
+        const err = (await chunkRes.json().catch(() => ({}))) as { error?: string };
+        throw new Error(err.error || 'ส่งชิ้นส่วนไฟล์เสียงไม่สำเร็จ');
+      }
+    }
+
+    const completeRes = await fetch(apiUrl('/api/streams/upload-complete'), {
+      method: 'POST',
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ uploadId }),
+    });
+    if (!completeRes.ok) {
+      const err = (await completeRes.json().catch(() => ({}))) as { error?: string };
+      throw new Error(err.error || 'ประกอบไฟล์เสียงไม่สำเร็จ');
+    }
+    const data = (await completeRes.json()) as { track: Track };
+    return hydrateTrackUrls(data.track);
+  }
+
   const res = await fetch(apiUrl('/api/streams/upload'), {
     method: 'POST',
     headers: authHeaders({
@@ -522,6 +833,7 @@ export async function publishTrackToServerStream(
       'x-track-filename': encodeURIComponent(filename),
       'x-track-title': encodeURIComponent(track.title),
       'x-track-artist': encodeURIComponent(track.artist),
+      'x-track-client-id': encodeURIComponent(track.id),
       ...(track.album ? { 'x-track-album': encodeURIComponent(track.album) } : {}),
       ...(track.genre ? { 'x-track-genre': encodeURIComponent(track.genre) } : {}),
       ...(folder ? { 'x-track-folder': encodeURIComponent(folder) } : {}),

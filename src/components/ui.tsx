@@ -1,4 +1,4 @@
-import { useState, type ComponentProps, type InputHTMLAttributes } from 'react';
+import { useEffect, useState, type ComponentProps, type InputHTMLAttributes } from 'react';
 
 export const Surface = ({
   inset = false,
@@ -91,6 +91,10 @@ export function TrackCover({
   spinning?: boolean;
 }) {
   const [imgFailed, setImgFailed] = useState(false);
+
+  useEffect(() => {
+    setImgFailed(false);
+  }, [src]);
 
   if (src && !imgFailed) {
     return (

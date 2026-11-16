@@ -81,7 +81,7 @@ input[type="range"].aura-range:focus-visible::-webkit-slider-thumb {
   background: var(--color-primary);
 }
 
-/* Vinyl spin animation */
+/* Vinyl & Cassette reel spin animations */
 @keyframes vinyl-spin {
   from {
     transform: rotate(0deg);
@@ -92,7 +92,11 @@ input[type="range"].aura-range:focus-visible::-webkit-slider-thumb {
 }
 
 .animate-vinyl {
-  animation: vinyl-spin 22s linear infinite;
+  animation: vinyl-spin 18s linear infinite;
+}
+
+.animate-tape-reel {
+  animation: vinyl-spin 4.2s linear infinite;
 }
 
 .paused-vinyl {

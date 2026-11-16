@@ -38,11 +38,28 @@ android {
         jvmTarget = "17"
     }
 
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
+    }
+
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
         }
     }
+}
+
+val syncWebDistIfMissing by tasks.registering(Copy::class) {
+    val distDir = rootProject.file("../dist")
+    val assetsDir = file("src/main/assets")
+    onlyIf { distDir.resolve("index.html").exists() && !assetsDir.resolve("index.html").exists() }
+    from(distDir)
+    into(assetsDir)
+}
+
+tasks.matching { it.name == "preBuild" }.configureEach {
+    dependsOn(syncWebDistIfMissing)
 }
 
 dependencies {

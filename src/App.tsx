@@ -21,8 +21,13 @@ import {
   Layers,
   ListMusic,
   ListPlus,
+  Maximize2,
+  Minimize2,
   Moon,
   Music2,
+  Network,
+  PanelLeftClose,
+  PanelLeftOpen,
   Pause,
   Pencil,
   Play,
@@ -52,12 +57,15 @@ import {
   WifiOff,
 } from 'lucide-react';
 import { AdminTrackModal } from './components/AdminTrackModal';
+import { AlbumShowcaseStage } from './components/AlbumShowcaseStage';
 import { AndroidGitHubModal } from './components/AndroidGitHubModal';
 import { AuthModal } from './components/AuthModal';
 import { CastModal, type AudioOutputDeviceOption } from './components/CastModal';
 import { EqualizerPopover } from './components/EqualizerPopover';
 import { HddStreamModal } from './components/HddStreamModal';
+import { LanNetworkModal } from './components/LanNetworkModal';
 import { PlaylistModal } from './components/PlaylistModal';
+import { OfflineIndicator, PWAInstallButton, PWAUpdateBanner } from './components/PWAInstallButton';
 import { QueueDrawer } from './components/QueueDrawer';
 import { ResetDataModal } from './components/ResetDataModal';
 import { StreamModal } from './components/StreamModal';
@@ -70,6 +78,9 @@ import type {
   EqBands,
   EqPresetKey,
   FormatFilter,
+  LanHostInfo,
+  LanSharedTrackMeta,
+  LanSignalPayload,
   LibraryGroupBy,
   LibraryTab,
   Playlist,
@@ -91,35 +102,48 @@ import {
   deleteServerStream,
   fetchAdminStatus,
   fetchConnectedDevices,
+  fetchLanHosts,
   fetchServerHddStreamsSafe,
   getOrCreateDeviceIdentity,
   getServerBaseUrl,
+  heartbeatLanHost,
   publishTrackToServerStream,
+  registerLanHost,
   reorderSharedStreams,
   rescanAllHostHddFolders,
   resolveTrackPlayableUrl,
   saveLocalDeviceName,
   sendCastCommand,
   subscribeToStreamEvents,
+  unregisterLanHost,
   updateDevicePresence,
   updateSharedStreamMeta,
   type LocalDeviceIdentity,
 } from './utils/api';
+import { LanP2PManager } from './utils/lanP2P';
 import {
   AUDIO_ACCEPT_STRING,
   collectFilesFromDataTransfer,
   decodeBlobToWavUrl,
+  extractCoverFromAudioBlob,
+  extractCoverFromImageFile,
   extractFolderNameFromRelativePath,
   extractLocalTrack,
   formatFileSize,
   formatTime,
+  getCoverImagePriority,
   getFileExtension,
   hashStringToSeed,
+  isCoverImageFilename,
   isSupportedAudioFile,
   isSupportedAudioFilename,
   parseM3uContent,
+  resizeImageBlobToDataUrl,
 } from './utils/audioMetadata';
 import {
+  adoptGuestLocalData,
+  clearCachedServerLibrary,
+  clearCachedStreamMedia,
   clearHddHandlesFromDb,
   clearLocalTracksFromDb,
   clearSyncedFolderSummaries,
@@ -127,31 +151,58 @@ import {
   deleteHddHandleFromDb,
   deleteLocalTrackFromDb,
   EQ_PRESETS,
+  getCachedStreamAudioBlob,
   getLocalBlobFromDb,
+  getStreamTrackSignature,
+  loadCachedServerLibrary,
+  loadCachedStreamCovers,
   loadHddHandlesFromDb,
   loadLocalTracksFromDb,
   loadSyncedFolderSummaries,
   loadThemePreference,
   loadUserPreferences,
+  pruneCachedStreamMedia,
   removeSyncedFolderSummary,
+  saveCachedServerLibrary,
+  saveCachedStreamAudioBlob,
+  saveCachedStreamCover,
   saveHddHandleToDb,
   saveLocalTracksBatchToDb,
+  saveLocalTracksMetaFirstToDb,
   saveSyncedFolderSummary,
   saveThemePreference,
   saveUserPreferences,
+  updateLocalTrackMetaInDb,
+  type LocalDbSaveItem,
   type StoredHddHandleRecord,
 } from './utils/storage';
 
 const EQ_FREQUENCIES = [60, 230, 910, 3600, 14000];
 
 export default function App() {
-  // --- Theme ---
+  // --- Theme & Layout Preferences ---
   const [theme, setTheme] = useState<'light' | 'dark'>(() => loadThemePreference());
+  const [sidebarCollapsed, setSidebarCollapsed] = useState<boolean>(() => {
+    try {
+      return localStorage.getItem('aura_sidebar_collapsed_v1') === '1';
+    } catch {
+      return false;
+    }
+  });
+  const [albumShowcaseOpen, setAlbumShowcaseOpen] = useState(false);
 
   useEffect(() => {
     document.documentElement.classList.toggle('dark', theme === 'dark');
     saveThemePreference(theme);
   }, [theme]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('aura_sidebar_collapsed_v1', sidebarCollapsed ? '1' : '0');
+    } catch {
+      // ignore storage failure
+    }
+  }, [sidebarCollapsed]);
 
   // --- Server-Backed Auth & Scoped Preferences ---
   const [currentUser, setCurrentUser] = useState<UserAccount | null>(null);
@@ -160,9 +211,20 @@ export default function App() {
   const isAdmin = currentUser?.role === 'admin';
   const ownerKey = currentUser ? currentUser.id : 'guest';
 
+  const initialServerScope = getServerBaseUrl() || 'origin';
+  const initialCachedLibraryRef = useRef<ReturnType<typeof loadCachedServerLibrary> | undefined>(
+    undefined
+  );
+  if (initialCachedLibraryRef.current === undefined) {
+    initialCachedLibraryRef.current = loadCachedServerLibrary(initialServerScope);
+  }
+  const initialCachedLib = initialCachedLibraryRef.current;
+
   const [prefs, setPrefs] = useState<UserPreferences>(() => loadUserPreferences('guest'));
   const [localTracks, setLocalTracks] = useState<Track[]>([]);
-  const [serverStreams, setServerStreams] = useState<Track[]>([]);
+  const [serverStreams, setServerStreams] = useState<Track[]>(
+    () => initialCachedLib?.tracks || []
+  );
   const [savedHddHandles, setSavedHddHandles] = useState<StoredHddHandleRecord[]>([]);
   const [syncedFolders, setSyncedFolders] = useState<SyncedHddFolderSummary[]>(() =>
     loadSyncedFolderSummaries('guest')
@@ -173,7 +235,9 @@ export default function App() {
     total: number;
   } | null>(null);
   const [syncState, setSyncState] = useState<'connecting' | 'connected' | 'reconnecting'>('connecting');
-  const [lastSyncAt, setLastSyncAt] = useState<number | null>(null);
+  const [lastSyncAt, setLastSyncAt] = useState<number | null>(
+    () => initialCachedLib?.cachedAt || null
+  );
   const [liveConnectedDevices, setLiveConnectedDevices] = useState<number>(1);
   const [deviceIdentity, setDeviceIdentity] = useState<LocalDeviceIdentity>(() =>
     getOrCreateDeviceIdentity()
@@ -200,14 +264,148 @@ export default function App() {
     updatedAt: Date.now(),
   });
   const [serverConfigVersion, setServerConfigVersion] = useState(0);
+  const [serverStreamsLoaded, setServerStreamsLoaded] = useState<boolean>(() =>
+    Boolean(initialCachedLib)
+  );
+  const serverCatalogVersionRef = useRef<string>(initialCachedLib?.version || '');
+  const serverStreamsLoadedRef = useRef<boolean>(Boolean(initialCachedLib));
+  const serverCoverCacheMapRef = useRef<Map<string, { signature: string; coverDataUrl: string }>>(
+    new Map()
+  );
+  const inflightStreamCoverIdsRef = useRef<Set<string>>(new Set());
+  const inflightStreamAudioIdsRef = useRef<Set<string>>(new Set());
 
-  const refreshServerStreams = useCallback(async () => {
-    const res = await fetchServerHddStreamsSafe();
-    if (res.ok) {
-      setServerStreams(res.tracks);
-      setLastSyncAt(Date.now());
+  useEffect(() => {
+    serverStreamsLoadedRef.current = serverStreamsLoaded;
+  }, [serverStreamsLoaded]);
+
+  // --- Local Network (LAN P2P + LAN Server) State ---
+  const [lanModalOpen, setLanModalOpen] = useState(false);
+  const [isSharingLan, setIsSharingLan] = useState(false);
+  const [sharingLanBusy, setSharingLanBusy] = useState(false);
+  const [lanHosts, setLanHosts] = useState<LanHostInfo[]>([]);
+  const [connectedLanHostIds, setConnectedLanHostIds] = useState<string[]>([]);
+  const [connectingLanHostId, setConnectingLanHostId] = useState<string | null>(null);
+  const [lanPeerCount, setLanPeerCount] = useState(0);
+  const [lanCoverCache, setLanCoverCache] = useState<Record<string, string>>({});
+  const lanCoverCacheRef = useRef<Record<string, string>>({});
+  const lanCoverInflightRef = useRef<Set<string>>(new Set());
+  const lanCoverTriedRef = useRef<Map<string, number>>(new Map());
+  const deviceIdentityRef = useRef<LocalDeviceIdentity>(deviceIdentity);
+  const lanSignalHandlerRef = useRef<(signal: LanSignalPayload) => void>(() => {});
+  const lanP2pRef = useRef<LanP2PManager | null>(null);
+  const desiredLanHostIdsRef = useRef<Set<string>>(new Set());
+  const lanHostMissingSinceRef = useRef<Map<string, number>>(new Map());
+
+  useEffect(() => {
+    lanCoverCacheRef.current = lanCoverCache;
+  }, [lanCoverCache]);
+
+  useEffect(() => {
+    deviceIdentityRef.current = deviceIdentity;
+  }, [deviceIdentity]);
+
+  useEffect(() => {
+    const isBusy = adminTask.state === 'working' || hddSyncProgress !== null;
+    if (!isBusy) return;
+    const onBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = '';
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [adminTask.state, hddSyncProgress]);
+
+  const applyCoverCacheToTracks = useCallback(
+    (tracks: Track[], coverMap: Map<string, { signature: string; coverDataUrl: string }>) => {
+      if (coverMap.size === 0) return tracks;
+      let changed = false;
+      const next = tracks.map((track) => {
+        const entry = coverMap.get(track.id);
+        if (entry && entry.signature === getStreamTrackSignature(track) && entry.coverDataUrl) {
+          if (track.coverDataUrl !== entry.coverDataUrl) {
+            changed = true;
+            return { ...track, coverDataUrl: entry.coverDataUrl };
+          }
+        }
+        return track;
+      });
+      return changed ? next : tracks;
+    },
+    []
+  );
+
+  const cacheNewStreamCovers = useCallback(async (tracks: Track[], scope: string) => {
+    const candidates = tracks.filter((track) => {
+      if (track.streamKind === 'url') return false;
+      if (!track.coverDataUrl || track.coverDataUrl.startsWith('data:')) return false;
+      const cached = serverCoverCacheMapRef.current.get(track.id);
+      if (cached && cached.signature === getStreamTrackSignature(track)) return false;
+      const inflightKey = `${scope}::${track.id}`;
+      return !inflightStreamCoverIdsRef.current.has(inflightKey);
+    });
+    if (candidates.length === 0) return;
+
+    const BATCH = 3;
+    for (let i = 0; i < candidates.length; i += BATCH) {
+      if ((getServerBaseUrl() || 'origin') !== scope) return;
+      const slice = candidates.slice(i, i + BATCH);
+      await Promise.all(
+        slice.map(async (track) => {
+          const inflightKey = `${scope}::${track.id}`;
+          inflightStreamCoverIdsRef.current.add(inflightKey);
+          try {
+            const res = await fetch(track.coverDataUrl!);
+            if (!res.ok) return;
+            const blob = await res.blob();
+            if (!blob || blob.size === 0) return;
+            const dataUrl = await resizeImageBlobToDataUrl(blob, 512);
+            if (!dataUrl) return;
+            const sig = getStreamTrackSignature(track);
+            serverCoverCacheMapRef.current.set(track.id, { signature: sig, coverDataUrl: dataUrl });
+            await saveCachedStreamCover(track, scope, dataUrl);
+            if ((getServerBaseUrl() || 'origin') !== scope) return;
+            setServerStreams((prev) =>
+              prev.map((item) =>
+                item.id === track.id && item.coverDataUrl !== dataUrl
+                  ? { ...item, coverDataUrl: dataUrl }
+                  : item
+              )
+            );
+          } catch {
+            // ignore transient cover fetch failure
+          }
+        })
+      );
     }
   }, []);
+
+  const refreshServerStreams = useCallback(
+    async (force = false) => {
+      const scope = getServerBaseUrl() || 'origin';
+      const knownVersion = force ? undefined : serverCatalogVersionRef.current || undefined;
+      const res = await fetchServerHddStreamsSafe(knownVersion);
+      if (!res.ok) return;
+
+      if (res.notModified) {
+        setServerStreamsLoaded(true);
+        setLastSyncAt(Date.now());
+        return;
+      }
+
+      const nextVersion = res.version || '';
+      serverCatalogVersionRef.current = nextVersion;
+      saveCachedServerLibrary(scope, nextVersion, res.tracks);
+      void pruneCachedStreamMedia(scope, res.tracks);
+
+      const hydrated = applyCoverCacheToTracks(res.tracks, serverCoverCacheMapRef.current);
+      setServerStreams(hydrated);
+      setServerStreamsLoaded(true);
+      setLastSyncAt(Date.now());
+      void cacheNewStreamCovers(res.tracks, scope);
+    },
+    [applyCoverCacheToTracks, cacheNewStreamCovers]
+  );
 
   const refreshAdminStatus = useCallback(async () => {
     if (!isAdmin) {
@@ -240,15 +438,52 @@ export default function App() {
     };
   }, []);
 
-  // Initial fetch + Real-time SSE sync & nearby device Cast listener
+  // Load remembered library from this device immediately, then validate with server (304 if unchanged) + SSE sync
   useEffect(() => {
+    let cancelled = false;
+    const scope = getServerBaseUrl() || 'origin';
+    const cachedLib = loadCachedServerLibrary(scope);
+
+    if (cachedLib) {
+      serverCatalogVersionRef.current = cachedLib.version;
+      setServerStreams(cachedLib.tracks);
+      setServerStreamsLoaded(true);
+      setLastSyncAt(cachedLib.cachedAt);
+    } else {
+      serverCatalogVersionRef.current = '';
+      setServerStreams([]);
+      setServerStreamsLoaded(false);
+    }
+
+    loadCachedStreamCovers(scope).then((coverMap) => {
+      if (cancelled) return;
+      serverCoverCacheMapRef.current = coverMap;
+      if (coverMap.size > 0) {
+        setServerStreams((prev) => applyCoverCacheToTracks(prev, coverMap));
+      }
+      if (cachedLib?.tracks.length) {
+        void cacheNewStreamCovers(cachedLib.tracks, scope);
+      }
+    });
+
     void refreshServerStreams();
     fetchConnectedDevices().then((devices) => {
-      setConnectedDevices(devices);
+      if (!cancelled) setConnectedDevices(devices);
+    });
+    fetchLanHosts().then((hosts) => {
+      if (!cancelled) setLanHosts(hosts);
     });
     let sseRefreshTimer: number | null = null;
     const unsubscribe = subscribeToStreamEvents(
-      () => {
+      (payload) => {
+        if (
+          payload.catalogVersion &&
+          payload.catalogVersion === serverCatalogVersionRef.current &&
+          serverStreamsLoadedRef.current
+        ) {
+          setLastSyncAt(Date.now());
+          return;
+        }
         if (sseRefreshTimer !== null) {
           window.clearTimeout(sseRefreshTimer);
         }
@@ -283,13 +518,62 @@ export default function App() {
         onCastCommand: (command) => {
           castCommandHandlerRef.current(command);
         },
+        onLanHostsChange: (hosts) => {
+          setLanHosts(hosts);
+          const presentIds = new Set(hosts.map((h) => h.deviceId));
+          const now = Date.now();
+          for (const id of desiredLanHostIdsRef.current) {
+            if (presentIds.has(id)) {
+              lanHostMissingSinceRef.current.delete(id);
+            } else if (!lanHostMissingSinceRef.current.has(id)) {
+              lanHostMissingSinceRef.current.set(id, now);
+            }
+          }
+          setConnectedLanHostIds((prev) => {
+            const next = new Set<string>();
+            for (const id of prev) {
+              if (presentIds.has(id)) {
+                next.add(id);
+              } else {
+                const missingSince = lanHostMissingSinceRef.current.get(id) ?? now;
+                if (now - missingSince < 15000) {
+                  next.add(id);
+                } else {
+                  desiredLanHostIdsRef.current.delete(id);
+                  lanHostMissingSinceRef.current.delete(id);
+                }
+              }
+            }
+            for (const id of desiredLanHostIdsRef.current) {
+              if (presentIds.has(id)) {
+                next.add(id);
+              }
+            }
+            if (next.size === prev.length && prev.every((id) => next.has(id))) {
+              return prev;
+            }
+            return Array.from(next);
+          });
+        },
+        onLanSignal: (signal) => {
+          lanSignalHandlerRef.current(signal);
+        },
       }
     );
     return () => {
+      cancelled = true;
       if (sseRefreshTimer !== null) window.clearTimeout(sseRefreshTimer);
       unsubscribe();
     };
-  }, [deviceIdentity, isAdmin, refreshAdminStatus, refreshServerStreams, serverConfigVersion]);
+  }, [
+    applyCoverCacheToTracks,
+    cacheNewStreamCovers,
+    deviceIdentity,
+    isAdmin,
+    refreshAdminStatus,
+    refreshServerStreams,
+    serverConfigVersion,
+  ]);
 
   // Refresh admin operational status when entering Admin tab or signing in as Admin
   useEffect(() => {
@@ -307,21 +591,31 @@ export default function App() {
     if (!authReady) return;
     let cancelled = false;
 
-    const localPrefs = loadUserPreferences(ownerKey);
-    setPrefs(localPrefs);
-
-    if (currentUser) {
-      apiLoadUserPrefs().then((remotePrefs) => {
-        if (!cancelled && remotePrefs) {
-          const merged = { ...localPrefs, ...remotePrefs };
-          setPrefs(merged);
-          saveUserPreferences(ownerKey, merged);
-        }
-      });
-    }
-
-    loadLocalTracksFromDb(ownerKey).then((loaded) => {
+    const loadScopedData = async () => {
+      if (currentUser) {
+        await adoptGuestLocalData(currentUser.id);
+      }
       if (cancelled) return;
+
+      const localPrefs = loadUserPreferences(ownerKey);
+      setPrefs(localPrefs);
+
+      if (currentUser) {
+        apiLoadUserPrefs().then((remotePrefs) => {
+          if (!cancelled && remotePrefs) {
+            const merged = { ...localPrefs, ...remotePrefs };
+            setPrefs(merged);
+            saveUserPreferences(ownerKey, merged);
+          }
+        });
+      }
+
+      const [loaded, handles] = await Promise.all([
+        loadLocalTracksFromDb(ownerKey),
+        loadHddHandlesFromDb(ownerKey),
+      ]);
+      if (cancelled) return;
+
       setLocalTracks((prev) => {
         if (prev.length === 0) return loaded;
         // Preserve already-synced session tracks when logging in/out instead of wiping them
@@ -340,13 +634,48 @@ export default function App() {
         });
         return [...liveSessionOnly, ...mergedLoaded];
       });
-    });
 
-    loadHddHandlesFromDb(ownerKey).then((handles) => {
-      if (!cancelled) setSavedHddHandles(handles);
-    });
+      setSavedHddHandles(handles);
+      setSyncedFolders(loadSyncedFolderSummaries(ownerKey));
 
-    setSyncedFolders(loadSyncedFolderSummaries(ownerKey));
+      // Backfill missing cover art for previously saved local tracks in background
+      const missingCovers = loaded.filter((t) => !t.coverDataUrl);
+      if (missingCovers.length > 0 && !cancelled) {
+        void (async () => {
+          for (let i = 0; i < missingCovers.length; i += 4) {
+            if (cancelled) return;
+            const batch = missingCovers.slice(i, i + 4);
+            const updates = new Map<string, string>();
+            await Promise.all(
+              batch.map(async (track) => {
+                try {
+                  const blob =
+                    inMemoryBlobMapRef.current.get(track.id) || (await getLocalBlobFromDb(track.id));
+                  if (!blob || cancelled) return;
+                  const coverDataUrl = await extractCoverFromAudioBlob(blob, 512);
+                  if (coverDataUrl && !cancelled) {
+                    updates.set(track.id, coverDataUrl);
+                    await updateLocalTrackMetaInDb({ ...track, coverDataUrl });
+                  }
+                } catch {
+                  // ignore individual backfill failures
+                }
+              })
+            );
+            if (updates.size > 0 && !cancelled) {
+              setLocalTracks((prev) =>
+                prev.map((t) => {
+                  const nextCover = updates.get(t.id);
+                  return nextCover && !t.coverDataUrl ? { ...t, coverDataUrl: nextCover } : t;
+                })
+              );
+            }
+          }
+        })();
+      }
+    };
+
+    void loadScopedData();
 
     return () => {
       cancelled = true;
@@ -367,10 +696,109 @@ export default function App() {
     [currentUser, ownerKey]
   );
 
-  // --- Combined Library (Shared Server Streams + Local Device HDD Tracks) ---
+  // --- Combined Library (Shared Server Streams + Local Device HDD Tracks + LAN P2P Tracks) ---
+  const serverStreamIdSet = useMemo(() => new Set(serverStreams.map((t) => t.id)), [serverStreams]);
+
+  const uniqueLocalTracks = useMemo(() => {
+    return localTracks.filter((t) => !t.publishedStreamId || !serverStreamIdSet.has(t.publishedStreamId));
+  }, [localTracks, serverStreamIdSet]);
+
+  const lanTracks = useMemo<Track[]>(() => {
+    const connectedSet = new Set(connectedLanHostIds);
+    const items: Track[] = [];
+    for (const host of lanHosts) {
+      if (host.deviceId === deviceIdentity.deviceId) continue;
+      if (!connectedSet.has(host.deviceId)) continue;
+      for (const meta of host.tracks) {
+        const lanId = `lan-${host.deviceId}-${meta.id}`;
+        const coverDataUrl = meta.coverDataUrl || lanCoverCache[lanId];
+        items.push({
+          id: lanId,
+          lanOriginalTrackId: meta.id,
+          lanHostDeviceId: host.deviceId,
+          lanHostDeviceName: host.deviceName,
+          title: meta.title,
+          artist: meta.artist,
+          album: meta.album,
+          genre: meta.genre,
+          folderName: meta.folderName || `LAN · ${host.deviceName}`,
+          source: 'lan',
+          format: meta.format,
+          formatDetail: `${meta.formatDetail} · LAN`,
+          isLossless: meta.isLossless,
+          durationSec: meta.durationSec,
+          durationLabel: meta.durationLabel,
+          url: '',
+          ...(coverDataUrl ? { coverDataUrl } : {}),
+          coverSeed: meta.coverSeed,
+          addedAt: meta.addedAt,
+          ownerId: host.deviceId,
+          sizeBytes: meta.sizeBytes,
+          sampleRate: meta.sampleRate,
+          bitrate: meta.bitrate,
+        });
+      }
+    }
+    return items;
+  }, [connectedLanHostIds, deviceIdentity.deviceId, lanCoverCache, lanHosts]);
+
+  // Fetch missing LAN album covers over WebRTC DataChannel without cancelling mid-batch
+  useEffect(() => {
+    if (connectedLanHostIds.length === 0 || !lanP2pRef.current) return;
+    const connectedSet = new Set(connectedLanHostIds);
+    const missing: Array<{ lanId: string; hostId: string; origId: string; hostUpdatedAt: number }> = [];
+    for (const host of lanHosts) {
+      if (host.deviceId === deviceIdentity.deviceId || !connectedSet.has(host.deviceId)) continue;
+      for (const meta of host.tracks) {
+        const lanId = `lan-${host.deviceId}-${meta.id}`;
+        if (meta.coverDataUrl) continue;
+        if (meta.hasCover === false) continue;
+        if (lanCoverCacheRef.current[lanId] || lanCoverInflightRef.current.has(lanId)) continue;
+        if (lanCoverTriedRef.current.get(lanId) === host.updatedAt) continue;
+        missing.push({
+          lanId,
+          hostId: host.deviceId,
+          origId: meta.id,
+          hostUpdatedAt: host.updatedAt,
+        });
+      }
+    }
+    if (missing.length === 0) return;
+
+    let cancelled = false;
+    void (async () => {
+      const BATCH = 3;
+      for (let i = 0; i < missing.length; i += BATCH) {
+        if (cancelled || !lanP2pRef.current) return;
+        const slice = missing.slice(i, i + BATCH);
+        await Promise.all(
+          slice.map(async (item) => {
+            if (cancelled || !lanP2pRef.current) return;
+            lanCoverInflightRef.current.add(item.lanId);
+            try {
+              const cover = await lanP2pRef.current.fetchTrackCover(item.hostId, item.origId);
+              if (cover) {
+                setLanCoverCache((prev) =>
+                  prev[item.lanId] ? prev : { ...prev, [item.lanId]: cover }
+                );
+              }
+              lanCoverTriedRef.current.set(item.lanId, item.hostUpdatedAt);
+            } finally {
+              lanCoverInflightRef.current.delete(item.lanId);
+            }
+          })
+        );
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [connectedLanHostIds, deviceIdentity.deviceId, lanHosts]);
+
   const allTracks = useMemo<Track[]>(() => {
-    return [...serverStreams, ...localTracks];
-  }, [serverStreams, localTracks]);
+    return [...serverStreams, ...uniqueLocalTracks, ...lanTracks];
+  }, [lanTracks, serverStreams, uniqueLocalTracks]);
 
   // --- Navigation, Grouping & Filters ---
   const [activeTab, setActiveTab] = useState<LibraryTab>('all');
@@ -382,6 +810,10 @@ export default function App() {
   useEffect(() => {
     setSelectedGroupKey('ALL');
   }, [groupBy, activeTab]);
+
+  useEffect(() => {
+    setAlbumShowcaseOpen(false);
+  }, [activeTab]);
 
   // Reset from admin tab if signed out
   useEffect(() => {
@@ -424,8 +856,10 @@ export default function App() {
     } else if (activeTab === 'stream') {
       list = [
         ...serverStreams,
-        ...(prefs.includeHddInStream ? localTracks : []),
+        ...(prefs.includeHddInStream ? uniqueLocalTracks : []),
       ];
+    } else if (activeTab === 'lan') {
+      list = lanTracks;
     } else if (activeTab === 'local') {
       list = [
         ...localTracks,
@@ -451,9 +885,9 @@ export default function App() {
     if (formatFilter === 'lossless') {
       list = list.filter((t) => t.isLossless);
     } else if (formatFilter === 'compressed') {
-      list = list.filter((t) => (t.source === 'local' || Boolean(t.hddPath)) && !t.isLossless);
+      list = list.filter((t) => (t.source === 'local' || t.source === 'lan' || Boolean(t.hddPath)) && !t.isLossless);
     } else if (formatFilter === 'stream') {
-      list = list.filter((t) => t.source === 'stream' || Boolean(t.publishedStreamId));
+      list = list.filter((t) => t.source === 'stream' || t.source === 'lan' || Boolean(t.publishedStreamId));
     }
 
     const q = searchQuery.trim().toLowerCase();
@@ -466,6 +900,7 @@ export default function App() {
           (t.genre && t.genre.toLowerCase().includes(q)) ||
           (t.folderName && t.folderName.toLowerCase().includes(q)) ||
           (t.syncedFolder && t.syncedFolder.toLowerCase().includes(q)) ||
+          (t.lanHostDeviceName && t.lanHostDeviceName.toLowerCase().includes(q)) ||
           t.format.toLowerCase().includes(q) ||
           t.formatDetail.toLowerCase().includes(q)
       );
@@ -476,6 +911,8 @@ export default function App() {
     allTracks,
     serverStreams,
     localTracks,
+    uniqueLocalTracks,
+    lanTracks,
     activeTab,
     formatFilter,
     searchQuery,
@@ -570,15 +1007,74 @@ export default function App() {
   const localSourceConnectedRef = useRef(false);
   const playRequestIdRef = useRef(0);
   const inMemoryBlobMapRef = useRef<Map<string, Blob>>(new Map());
+  const remoteBlobCacheRef = useRef<Map<string, Blob>>(new Map());
+  const tempPlaybackUrlsRef = useRef<string[]>([]);
   const playbackRetryCountRef = useRef(0);
   const retryTimerRef = useRef<number | null>(null);
   const stallTimerRef = useRef<number | null>(null);
   const intentionalPauseRef = useRef(false);
+  const wantPlayingRef = useRef(false);
+  const suppressPauseUntilRef = useRef(0);
   const lastPlaybackTimeRef = useRef(0);
   const currentTrackRef = useRef<Track | null>(null);
   const isPlayingRef = useRef(false);
+  const localTracksRef = useRef<Track[]>([]);
+  const serverStreamsRef = useRef<Track[]>([]);
+  const autoPublishingRef = useRef(false);
+  const autoReconnectedIdsRef = useRef<Set<string>>(new Set());
   const activeCastTargetRef = useRef<ConnectedCastDevice | null>(null);
+  const handlingPlayFallbackRef = useRef<number>(0);
+  const isSharingLanRef = useRef(false);
   const attemptRecoveryRef = useRef<(reason: 'error' | 'stalled') => void>(() => {});
+
+  const cacheRemoteBlob = useCallback((trackId: string, blob: Blob) => {
+    const cache = remoteBlobCacheRef.current;
+    if (cache.has(trackId)) {
+      cache.delete(trackId);
+    }
+    while (cache.size >= 2) {
+      const oldestKey = cache.keys().next().value;
+      if (!oldestKey) break;
+      cache.delete(oldestKey);
+    }
+    cache.set(trackId, blob);
+  }, []);
+
+  const registerTempPlaybackUrl = useCallback((url: string) => {
+    if (!url || !url.startsWith('blob:')) return;
+    const queue = tempPlaybackUrlsRef.current;
+    if (!queue.includes(url)) {
+      queue.push(url);
+    }
+    while (queue.length > 2) {
+      const oldest = queue.shift();
+      if (oldest) {
+        try {
+          URL.revokeObjectURL(oldest);
+        } catch {
+          // ignore
+        }
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    const cache = remoteBlobCacheRef.current;
+    const urls = tempPlaybackUrlsRef.current;
+    return () => {
+      cache.clear();
+      while (urls.length > 0) {
+        const u = urls.shift();
+        if (u) {
+          try {
+            URL.revokeObjectURL(u);
+          } catch {
+            // ignore
+          }
+        }
+      }
+    };
+  }, []);
 
   // --- Playback State ---
   const [currentTrack, setCurrentTrack] = useState<Track | null>(null);
@@ -601,6 +1097,14 @@ export default function App() {
   useEffect(() => {
     isPlayingRef.current = isPlaying;
   }, [isPlaying]);
+
+  useEffect(() => {
+    localTracksRef.current = localTracks;
+  }, [localTracks]);
+
+  useEffect(() => {
+    serverStreamsRef.current = serverStreams;
+  }, [serverStreams]);
 
   useEffect(() => {
     activeCastTargetRef.current = activeCastTarget;
@@ -628,6 +1132,7 @@ export default function App() {
     if (
       updated &&
       (updated.url !== currentTrack.url ||
+        updated.coverDataUrl !== currentTrack.coverDataUrl ||
         updated.title !== currentTrack.title ||
         updated.artist !== currentTrack.artist ||
         updated.album !== currentTrack.album ||
@@ -723,7 +1228,7 @@ export default function App() {
   // Keep AudioContext & active playback alive when tab/app returns to foreground or network reconnects
   useEffect(() => {
     const handleKeepAlive = () => {
-      if (!isPlayingRef.current || activeCastTargetRef.current) return;
+      if ((!isPlayingRef.current && !wantPlayingRef.current) || activeCastTargetRef.current) return;
       if (audioCtxRef.current && audioCtxRef.current.state !== 'running') {
         audioCtxRef.current.resume().catch(() => {});
       }
@@ -777,8 +1282,12 @@ export default function App() {
     if (remoteAudioRef.current) remoteAudioRef.current.playbackRate = prefs.playbackRate;
   }, [prefs.playbackRate]);
 
-  const stopAllEngines = useCallback(() => {
+  const stopAllEngines = useCallback((preserveIntent = false) => {
     intentionalPauseRef.current = true;
+    suppressPauseUntilRef.current = performance.now() + 450;
+    if (!preserveIntent) {
+      wantPlayingRef.current = false;
+    }
     clearPlaybackTimers();
     if (localAudioRef.current) localAudioRef.current.pause();
     if (remoteAudioRef.current) remoteAudioRef.current.pause();
@@ -788,6 +1297,7 @@ export default function App() {
     if (!track) return false;
     return (
       track.source === 'local' ||
+      track.source === 'lan' ||
       track.url.startsWith('/api/streams/') ||
       track.url.startsWith('/api/hdd/') ||
       track.url.includes('/api/streams/') ||
@@ -819,6 +1329,175 @@ export default function App() {
     return `${url}${sep}_r=${Date.now()}`;
   }, []);
 
+  const cacheStreamAudioInBackground = useCallback(
+    async (track: Track, sourceUrl: string, scope: string) => {
+      if (track.source !== 'stream' || track.streamKind === 'url' || !sourceUrl) return;
+      if ((track.sizeBytes || 0) > 45 * 1024 * 1024) return;
+      const inflightKey = `${scope}::${track.id}`;
+      if (inflightStreamAudioIdsRef.current.has(inflightKey)) return;
+      inflightStreamAudioIdsRef.current.add(inflightKey);
+      try {
+        const existing = await getCachedStreamAudioBlob(track, scope);
+        if (existing) return;
+        const res = await fetch(sourceUrl);
+        if (!res.ok) return;
+        const blob = await res.blob();
+        if (blob.size > 0 && blob.size <= 45 * 1024 * 1024) {
+          await saveCachedStreamAudioBlob(track, scope, blob);
+        }
+      } catch {
+        // non-fatal background cache
+      } finally {
+        inflightStreamAudioIdsRef.current.delete(inflightKey);
+      }
+    },
+    []
+  );
+
+  const tryFetchBlobAndPlay = useCallback(
+    async (
+      sourceUrl: string,
+      track: Track,
+      el: HTMLAudioElement,
+      startAtSec: number,
+      reqId: number
+    ): Promise<{ ok: boolean; errorHint?: string }> => {
+      const scope = getServerBaseUrl() || 'origin';
+      let blob: Blob | undefined =
+        remoteBlobCacheRef.current.get(track.id) ?? inMemoryBlobMapRef.current.get(track.id);
+
+      if (!blob && track.source === 'stream' && track.streamKind !== 'url') {
+        const idbBlob = await getCachedStreamAudioBlob(track, scope);
+        if (playRequestIdRef.current !== reqId) return { ok: false };
+        if (idbBlob) {
+          blob = idbBlob;
+          cacheRemoteBlob(track.id, idbBlob);
+        }
+      }
+
+      const findLocalMatch = () =>
+        localTracksRef.current.find(
+          (t) =>
+            t.publishedStreamId === track.id ||
+            (t.title.toLowerCase() === track.title.toLowerCase() &&
+              (t.sizeBytes || 0) > 0 &&
+              (t.sizeBytes || 0) === (track.sizeBytes || 0))
+        );
+
+      if (!blob && sourceUrl) {
+        try {
+          const res = await fetch(sourceUrl);
+          if (playRequestIdRef.current !== reqId) return { ok: false };
+          if (res.ok) {
+            const fetched = await res.blob();
+            if (playRequestIdRef.current !== reqId) return { ok: false };
+            if (fetched.size > 0) {
+              blob = fetched;
+              cacheRemoteBlob(track.id, fetched);
+              if (track.source === 'stream' && track.streamKind !== 'url') {
+                void saveCachedStreamAudioBlob(track, scope, fetched);
+              }
+            }
+          } else if (res.status === 404) {
+            void refreshServerStreams();
+            const localCopy = findLocalMatch();
+            if (localCopy) {
+              const localBlob =
+                inMemoryBlobMapRef.current.get(localCopy.id) || (await getLocalBlobFromDb(localCopy.id));
+              if (playRequestIdRef.current !== reqId) return { ok: false };
+              if (localBlob) blob = localBlob;
+            }
+            if (!blob) {
+              return {
+                ok: false,
+                errorHint: `ไม่พบไฟล์เสียง "${track.title}" บนเซิร์ฟเวอร์ (404) — ให้ Admin กดซิงค์เพลงใหม่ หรือเปิดผ่านโหมด Local Network`,
+              };
+            }
+          }
+        } catch {
+          const localCopy = findLocalMatch();
+          if (localCopy) {
+            const localBlob =
+              inMemoryBlobMapRef.current.get(localCopy.id) || (await getLocalBlobFromDb(localCopy.id));
+            if (playRequestIdRef.current !== reqId) return { ok: false };
+            if (localBlob) blob = localBlob;
+          }
+          if (
+            !blob &&
+            typeof window !== 'undefined' &&
+            window.location.protocol === 'https:' &&
+            sourceUrl.startsWith('http://')
+          ) {
+            return {
+              ok: false,
+              errorHint:
+                'เบราว์เซอร์บล็อกเสียง HTTP จากหน้าเว็บ HTTPS (Mixed Content) — แนะนำให้ใช้โหมดแชร์วง LAN P2P หรือแอพ Android',
+            };
+          }
+        }
+      }
+
+      if (!blob) {
+        const localCopy = findLocalMatch();
+        if (localCopy) {
+          const localBlob =
+            inMemoryBlobMapRef.current.get(localCopy.id) || (await getLocalBlobFromDb(localCopy.id));
+          if (playRequestIdRef.current !== reqId) return { ok: false };
+          if (localBlob) blob = localBlob;
+        }
+      }
+
+      if (!blob) return { ok: false };
+
+      const blobUrl = URL.createObjectURL(blob);
+      registerTempPlaybackUrl(blobUrl);
+      activeEngineRef.current = 'local';
+      if (remoteAudioRef.current && remoteAudioRef.current.getAttribute('src')) {
+        remoteAudioRef.current.pause();
+        remoteAudioRef.current.removeAttribute('src');
+        remoteAudioRef.current.load();
+      }
+
+      el.removeAttribute('crossorigin');
+      el.src = blobUrl;
+      el.playbackRate = prefs.playbackRate;
+      el.load();
+      seekAudioWhenReady(el, startAtSec);
+
+      try {
+        await el.play();
+        if (playRequestIdRef.current !== reqId) return { ok: false };
+        setIsPlaying(true);
+        setIsBuffering(false);
+        return { ok: true };
+      } catch {
+        if (playRequestIdRef.current !== reqId) return { ok: false };
+        const wavUrl = await decodeBlobToWavUrl(blob);
+        if (playRequestIdRef.current !== reqId) return { ok: false };
+        if (wavUrl) {
+          registerTempPlaybackUrl(wavUrl);
+          el.removeAttribute('crossorigin');
+          el.src = wavUrl;
+          el.playbackRate = prefs.playbackRate;
+          el.load();
+          seekAudioWhenReady(el, startAtSec);
+          try {
+            await el.play();
+            if (playRequestIdRef.current !== reqId) return { ok: false };
+            setIsPlaying(true);
+            setIsBuffering(false);
+            showStatus(`ถอดรหัสเสียง ${track.format} ผ่านโหมดความเข้ากันได้สูงสำเร็จ`);
+            return { ok: true };
+          } catch {
+            // fall through
+          }
+        }
+      }
+      return { ok: false };
+    },
+    [cacheRemoteBlob, prefs.playbackRate, refreshServerStreams, registerTempPlaybackUrl, seekAudioWhenReady, showStatus]
+  );
+
   const playTrackLocally = useCallback(
     async (
       track: Track,
@@ -826,6 +1505,7 @@ export default function App() {
       options?: { forceRemoteEngine?: boolean; cacheBust?: boolean; resetRetry?: boolean }
     ) => {
       const reqId = ++playRequestIdRef.current;
+      handlingPlayFallbackRef.current = reqId;
       if (options?.resetRetry !== false) {
         playbackRetryCountRef.current = 0;
       }
@@ -842,13 +1522,43 @@ export default function App() {
         recentIds: [track.id, ...prev.recentIds.filter((id) => id !== track.id)].slice(0, 30),
       }));
 
-      stopAllEngines();
+      stopAllEngines(true);
+      wantPlayingRef.current = true;
       intentionalPauseRef.current = false;
+      suppressPauseUntilRef.current = performance.now() + 450;
 
-      const useLocalEngine = !options?.forceRemoteEngine && isSameOriginTrack(track);
+      const resolvedServerUrl =
+        track.source === 'stream'
+          ? resolveTrackPlayableUrl(
+              track.streamKind === 'url' ? track.url : track.streamUrl || track.url
+            )
+          : track.url;
+
+      const scope = getServerBaseUrl() || 'origin';
+      let cachedStreamBlob: Blob | null = null;
+      if (track.source === 'stream' && track.streamKind !== 'url') {
+        const memStreamBlob =
+          remoteBlobCacheRef.current.get(track.id) ??
+          inMemoryBlobMapRef.current.get(track.id) ??
+          null;
+        cachedStreamBlob =
+          memStreamBlob || (await getCachedStreamAudioBlob(track, scope));
+        if (playRequestIdRef.current !== reqId) return;
+        if (cachedStreamBlob) {
+          cacheRemoteBlob(track.id, cachedStreamBlob);
+        }
+      }
+
+      const useLocalEngine =
+        !options?.forceRemoteEngine &&
+        (Boolean(cachedStreamBlob) || isSameOriginTrack(track));
 
       if (useLocalEngine) {
         activeEngineRef.current = 'local';
+        if (remoteAudioRef.current && remoteAudioRef.current.getAttribute('src')) {
+          remoteAudioRef.current.removeAttribute('src');
+          remoteAudioRef.current.load();
+        }
         await resumeAudioContextBounded();
         if (playRequestIdRef.current !== reqId) return;
 
@@ -856,13 +1566,98 @@ export default function App() {
         if (!el) return;
         setIsBuffering(true);
 
-        // Always rebuild blob URL from in-memory or IndexedDB cache if needed
-        let playableUrl = track.url;
-        const memBlob = inMemoryBlobMapRef.current.get(track.id);
-        if (track.source === 'local' && (!playableUrl || !playableUrl.startsWith('blob:')) && memBlob) {
-          playableUrl = URL.createObjectURL(memBlob);
-        } else if (options?.cacheBust) {
+        // Always rebuild blob URL from in-memory, IndexedDB, or LAN P2P if missing
+        let playableUrl = resolvedServerUrl;
+        const memBlob =
+          cachedStreamBlob ??
+          remoteBlobCacheRef.current.get(track.id) ??
+          inMemoryBlobMapRef.current.get(track.id);
+
+        if (cachedStreamBlob && track.source === 'stream') {
+          playableUrl = URL.createObjectURL(cachedStreamBlob);
+          registerTempPlaybackUrl(playableUrl);
+        }
+
+        if (track.source === 'lan') {
+          if (memBlob) {
+            if (playableUrl && playableUrl.startsWith('blob:')) {
+              registerTempPlaybackUrl(playableUrl);
+            } else {
+              playableUrl = URL.createObjectURL(memBlob);
+              registerTempPlaybackUrl(playableUrl);
+            }
+          } else if (track.lanHostDeviceId && lanP2pRef.current) {
+            try {
+              showStatus(`กำลังรับเสียง "${track.title}" จาก ${track.lanHostDeviceName || 'LAN'}...`);
+              const lanBlob = await lanP2pRef.current.fetchTrackBlob(
+                track.lanHostDeviceId,
+                track.lanOriginalTrackId || track.id,
+                (received, total) => {
+                  if (playRequestIdRef.current !== reqId) return;
+                  if (total > 0) {
+                    const pct = Math.min(100, Math.round((received / total) * 100));
+                    showStatus(`รับเสียง "${track.title}" ผ่าน LAN (${pct}%)`);
+                  }
+                }
+              );
+              if (playRequestIdRef.current !== reqId) return;
+              cacheRemoteBlob(track.id, lanBlob);
+              if (!track.coverDataUrl && !lanCoverCacheRef.current[track.id]) {
+                void extractCoverFromAudioBlob(lanBlob, 512).then((cover) => {
+                  if (cover) {
+                    setLanCoverCache((prev) =>
+                      prev[track.id] ? prev : { ...prev, [track.id]: cover }
+                    );
+                  }
+                });
+              }
+              playableUrl = URL.createObjectURL(lanBlob);
+              registerTempPlaybackUrl(playableUrl);
+              setCurrentTrack((prev) =>
+                prev && prev.id === track.id ? { ...prev, url: playableUrl } : prev
+              );
+            } catch (lanErr) {
+              if (playRequestIdRef.current !== reqId) return;
+              handlingPlayFallbackRef.current = 0;
+              wantPlayingRef.current = false;
+              setIsPlaying(false);
+              setIsBuffering(false);
+              setPlaybackError(
+                lanErr instanceof Error
+                  ? lanErr.message
+                  : `ไม่สามารถรับเสียง "${track.title}" ผ่าน Local Network ได้`
+              );
+              return;
+            }
+          }
+        } else if (track.source === 'local' && (!playableUrl || !playableUrl.startsWith('blob:'))) {
+          const resolvedBlob = memBlob || (await getLocalBlobFromDb(track.id));
+          if (playRequestIdRef.current !== reqId) return;
+          if (resolvedBlob) {
+            inMemoryBlobMapRef.current.set(track.id, resolvedBlob);
+            playableUrl = URL.createObjectURL(resolvedBlob);
+            setLocalTracks((prev) =>
+              prev.map((t) => (t.id === track.id ? { ...t, url: playableUrl } : t))
+            );
+            setCurrentTrack((prev) =>
+              prev && prev.id === track.id ? { ...prev, url: playableUrl } : prev
+            );
+          }
+        } else if (options?.cacheBust && playableUrl) {
           playableUrl = appendCacheBust(playableUrl);
+        }
+
+        if (!playableUrl) {
+          handlingPlayFallbackRef.current = 0;
+          wantPlayingRef.current = false;
+          setIsPlaying(false);
+          setIsBuffering(false);
+          setPlaybackError(
+            track.source === 'lan'
+              ? `ยังไม่ได้เชื่อมต่อโฮสต์ "${track.lanHostDeviceName || 'LAN'}" เพื่อโหลด "${track.title}"`
+              : `ยังไม่ได้เชื่อมต่อไฟล์ "${track.title}" หลังรีเฟรช — กดปุ่มซิงค์โฟลเดอร์ HDD ด้านบนเพื่อเชื่อมต่อต่อทันที`
+          );
+          return;
         }
 
         if (playableUrl.startsWith('blob:') || playableUrl.startsWith('data:')) {
@@ -879,30 +1674,49 @@ export default function App() {
         try {
           await el.play();
           if (playRequestIdRef.current !== reqId) return;
+          handlingPlayFallbackRef.current = 0;
           setIsPlaying(true);
           setIsBuffering(false);
+          if (track.source === 'stream' && track.streamKind !== 'url' && !cachedStreamBlob) {
+            void cacheStreamAudioInBackground(track, resolvedServerUrl, scope);
+          }
         } catch (playErr) {
           if (playRequestIdRef.current !== reqId) return;
           const errName = playErr instanceof DOMException ? playErr.name : '';
 
           if (errName === 'AbortError') {
+            handlingPlayFallbackRef.current = 0;
             setIsBuffering(false);
             return;
           }
 
           if (errName === 'NotAllowedError') {
+            handlingPlayFallbackRef.current = 0;
+            wantPlayingRef.current = false;
             setIsPlaying(false);
             setIsBuffering(false);
             showStatus(`พร้อมเล่น "${track.title}" — กดปุ่ม Play เพื่อเริ่มฟัง`);
             return;
           }
 
-          if (track.source === 'local') {
-            const storedBlob = memBlob || (await getLocalBlobFromDb(track.id));
+          if (track.source === 'local' || track.source === 'lan' || cachedStreamBlob) {
+            const storedBlob =
+              cachedStreamBlob ||
+              remoteBlobCacheRef.current.get(track.id) ||
+              inMemoryBlobMapRef.current.get(track.id) ||
+              (track.source === 'local' ? await getLocalBlobFromDb(track.id) : null);
             if (playRequestIdRef.current !== reqId) return;
 
             if (storedBlob) {
+              if (track.source === 'local') {
+                inMemoryBlobMapRef.current.set(track.id, storedBlob);
+              } else {
+                cacheRemoteBlob(track.id, storedBlob);
+              }
               const freshBlobUrl = URL.createObjectURL(storedBlob);
+              if (track.source === 'lan') {
+                registerTempPlaybackUrl(freshBlobUrl);
+              }
               el.removeAttribute('crossorigin');
               el.src = freshBlobUrl;
               el.load();
@@ -910,9 +1724,12 @@ export default function App() {
               try {
                 await el.play();
                 if (playRequestIdRef.current !== reqId) return;
-                setLocalTracks((prev) =>
-                  prev.map((t) => (t.id === track.id ? { ...t, url: freshBlobUrl } : t))
-                );
+                handlingPlayFallbackRef.current = 0;
+                if (track.source === 'local') {
+                  setLocalTracks((prev) =>
+                    prev.map((t) => (t.id === track.id ? { ...t, url: freshBlobUrl } : t))
+                  );
+                }
                 setCurrentTrack((prev) =>
                   prev && prev.id === track.id ? { ...prev, url: freshBlobUrl } : prev
                 );
@@ -926,6 +1743,7 @@ export default function App() {
               const wavUrl = await decodeBlobToWavUrl(storedBlob);
               if (playRequestIdRef.current !== reqId) return;
               if (wavUrl) {
+                registerTempPlaybackUrl(wavUrl);
                 el.removeAttribute('crossorigin');
                 el.src = wavUrl;
                 el.load();
@@ -933,6 +1751,7 @@ export default function App() {
                 try {
                   await el.play();
                   if (playRequestIdRef.current !== reqId) return;
+                  handlingPlayFallbackRef.current = 0;
                   setIsPlaying(true);
                   setIsBuffering(false);
                   showStatus(`แปลงไฟล์ ${track.format} ผ่านตัวถอดรหัส PCM สำเร็จ`);
@@ -942,32 +1761,68 @@ export default function App() {
                 }
               }
             }
-          } else if (remoteAudioRef.current) {
-            // Fallback to remoteAudioRef (bypasses WebAudio CORS restrictions on cross-origin streams)
-            activeEngineRef.current = 'remote';
-            const fallbackEl = remoteAudioRef.current;
-            fallbackEl.src = options?.cacheBust ? appendCacheBust(playableUrl) : playableUrl;
-            fallbackEl.volume = isMuted ? 0 : prefs.volume;
-            fallbackEl.muted = isMuted;
-            fallbackEl.playbackRate = prefs.playbackRate;
-            fallbackEl.load();
-            seekAudioWhenReady(fallbackEl, startAtSec);
-            try {
-              await fallbackEl.play();
-              if (playRequestIdRef.current !== reqId) return;
-              setIsPlaying(true);
-              setIsBuffering(false);
+          } else {
+            // Stream track fallback 1: try remoteAudioRef (no CORS / WebAudio restrictions)
+            if (remoteAudioRef.current) {
+              activeEngineRef.current = 'remote';
+              suppressPauseUntilRef.current = performance.now() + 450;
+              el.pause();
+              el.removeAttribute('src');
+              el.load();
+
+              const fallbackEl = remoteAudioRef.current;
+              fallbackEl.src = options?.cacheBust
+                ? appendCacheBust(resolvedServerUrl)
+                : resolvedServerUrl;
+              fallbackEl.volume = isMuted ? 0 : prefs.volume;
+              fallbackEl.muted = isMuted;
+              fallbackEl.playbackRate = prefs.playbackRate;
+              fallbackEl.load();
+              seekAudioWhenReady(fallbackEl, startAtSec);
+              try {
+                await fallbackEl.play();
+                if (playRequestIdRef.current !== reqId) return;
+                handlingPlayFallbackRef.current = 0;
+                setIsPlaying(true);
+                setIsBuffering(false);
+                return;
+              } catch {
+                // Continue to Blob / PCM / local-copy fallback
+              }
+            }
+
+            // Stream track fallback 2: fetch Blob directly -> ObjectURL -> PCM WAV / local copy
+            const blobFallback = await tryFetchBlobAndPlay(
+              resolvedServerUrl,
+              track,
+              el,
+              startAtSec,
+              reqId
+            );
+            if (playRequestIdRef.current !== reqId) return;
+            if (blobFallback.ok) {
+              handlingPlayFallbackRef.current = 0;
               return;
-            } catch {
-              // fall through to error banner
+            }
+            if (blobFallback.errorHint) {
+              handlingPlayFallbackRef.current = 0;
+              wantPlayingRef.current = false;
+              setIsPlaying(false);
+              setIsBuffering(false);
+              setPlaybackError(blobFallback.errorHint);
+              return;
             }
           }
 
+          handlingPlayFallbackRef.current = 0;
+          wantPlayingRef.current = false;
           setIsPlaying(false);
           setIsBuffering(false);
           setPlaybackError(
             track.source === 'local'
               ? `ไม่สามารถเปิดไฟล์ ${track.format} นี้ได้ กรุณากดซิงค์โฟลเดอร์ใหม่อีกครั้ง`
+              : track.source === 'lan'
+              ? `ไม่สามารถเล่นไฟล์ ${track.format} จาก Local Network ได้`
               : `ไม่สามารถโหลดเสียง "${track.title}" จากเซิร์ฟเวอร์ได้`
           );
         }
@@ -976,10 +1831,14 @@ export default function App() {
 
       // Remote / Cross-Origin / Direct Stream Element
       activeEngineRef.current = 'remote';
+      if (localAudioRef.current && localAudioRef.current.getAttribute('src')) {
+        localAudioRef.current.removeAttribute('src');
+        localAudioRef.current.load();
+      }
       const remoteEl = remoteAudioRef.current;
       if (!remoteEl) return;
       setIsBuffering(true);
-      remoteEl.src = options?.cacheBust ? appendCacheBust(track.url) : track.url;
+      remoteEl.src = options?.cacheBust ? appendCacheBust(resolvedServerUrl) : resolvedServerUrl;
       remoteEl.volume = isMuted ? 0 : prefs.volume;
       remoteEl.muted = isMuted;
       remoteEl.playbackRate = prefs.playbackRate;
@@ -988,36 +1847,77 @@ export default function App() {
       try {
         await remoteEl.play();
         if (playRequestIdRef.current !== reqId) return;
+        handlingPlayFallbackRef.current = 0;
         setIsPlaying(true);
         setIsBuffering(false);
+        if (track.source === 'stream' && track.streamKind !== 'url' && !cachedStreamBlob) {
+          void cacheStreamAudioInBackground(track, resolvedServerUrl, scope);
+        }
       } catch (err) {
         if (playRequestIdRef.current !== reqId) return;
         const errName = err instanceof DOMException ? err.name : '';
         if (errName === 'AbortError') {
+          handlingPlayFallbackRef.current = 0;
           setIsBuffering(false);
           return;
         }
         if (errName === 'NotAllowedError') {
+          handlingPlayFallbackRef.current = 0;
+          wantPlayingRef.current = false;
           setIsPlaying(false);
           setIsBuffering(false);
           showStatus(`พร้อมเล่น "${track.title}" — กดปุ่ม Play เพื่อเริ่มฟัง`);
           return;
         }
+
+        if (track.source === 'stream' && localAudioRef.current) {
+          const blobFallback = await tryFetchBlobAndPlay(
+            resolvedServerUrl,
+            track,
+            localAudioRef.current,
+            startAtSec,
+            reqId
+          );
+          if (playRequestIdRef.current !== reqId) return;
+          if (blobFallback.ok) {
+            handlingPlayFallbackRef.current = 0;
+            return;
+          }
+          if (blobFallback.errorHint) {
+            handlingPlayFallbackRef.current = 0;
+            wantPlayingRef.current = false;
+            setIsPlaying(false);
+            setIsBuffering(false);
+            setPlaybackError(blobFallback.errorHint);
+            return;
+          }
+        }
+
+        handlingPlayFallbackRef.current = 0;
+        wantPlayingRef.current = false;
         setIsPlaying(false);
         setIsBuffering(false);
-        setPlaybackError('ไม่สามารถเชื่อมต่อสตรีมจากลิงก์นี้ได้');
+        setPlaybackError(
+          track.source === 'stream' && track.streamKind !== 'url'
+            ? `ไม่สามารถโหลดเสียง "${track.title}" จากเซิร์ฟเวอร์ได้`
+            : 'ไม่สามารถเชื่อมต่อสตรีมจากลิงก์นี้ได้'
+        );
       }
     },
     [
       appendCacheBust,
+      cacheRemoteBlob,
+      cacheStreamAudioInBackground,
       isMuted,
       isSameOriginTrack,
       prefs.playbackRate,
       prefs.volume,
+      registerTempPlaybackUrl,
       resumeAudioContextBounded,
       seekAudioWhenReady,
       showStatus,
       stopAllEngines,
+      tryFetchBlobAndPlay,
       updatePrefs,
     ]
   );
@@ -1026,13 +1926,32 @@ export default function App() {
   useEffect(() => {
     attemptRecoveryRef.current = (reason: 'error' | 'stalled') => {
       const track = currentTrackRef.current;
-      if (!track || activeCastTargetRef.current || intentionalPauseRef.current) return;
+      if (!track || activeCastTargetRef.current || intentionalPauseRef.current || !wantPlayingRef.current) {
+        return;
+      }
 
       const el = getActiveAudioElement();
       if (el?.ended) return;
 
       const attempt = playbackRetryCountRef.current + 1;
       if (attempt > 3) {
+        // Fallback: if a server stream dropped, try playing its local cached copy seamlessly
+        if (track.source === 'stream') {
+          const localCopy = localTracksRef.current.find(
+            (t) =>
+              t.publishedStreamId === track.id ||
+              (t.title.toLowerCase() === track.title.toLowerCase() &&
+                (t.sizeBytes || 0) === (track.sizeBytes || 0))
+          );
+          if (localCopy) {
+            const resumePos = Math.max(lastPlaybackTimeRef.current || 0, el?.currentTime || 0);
+            playbackRetryCountRef.current = 0;
+            void playTrackLocally(localCopy, resumePos, { resetRetry: true });
+            return;
+          }
+        }
+
+        wantPlayingRef.current = false;
         setIsBuffering(false);
         setIsPlaying(false);
         setPlaybackError(
@@ -1040,7 +1959,7 @@ export default function App() {
             ? `การเชื่อมต่อเสียง "${track.title}" ขาดหาย — กด Play เพื่อเชื่อมต่อใหม่`
             : track.source === 'local'
             ? `ไฟล์เสียง "${track.title}" หลุดการเชื่อมต่อ กรุณากดเล่นอีกครั้ง`
-            : `สตรีม "${track.title}" ขาดการเชื่อมต่อชั่วคราว — กด Play เพื่อลองใหม่`
+            : `ไม่สามารถโหลดเสียง "${track.title}" จากเซิร์ฟเวอร์ได้ — กด Play เพื่อลองใหม่`
         );
         return;
       }
@@ -1057,7 +1976,13 @@ export default function App() {
       }
       retryTimerRef.current = window.setTimeout(() => {
         retryTimerRef.current = null;
-        if (playRequestIdRef.current !== reqSnapshot || intentionalPauseRef.current) return;
+        if (
+          playRequestIdRef.current !== reqSnapshot ||
+          intentionalPauseRef.current ||
+          !wantPlayingRef.current
+        ) {
+          return;
+        }
         const useFallbackRemote =
           track.source === 'stream' &&
           (activeEngineRef.current === 'remote' || attempt >= 2 || reason === 'error');
@@ -1213,17 +2138,22 @@ export default function App() {
     };
   }, [getActiveAudioElement, playTrackLocally, showStatus, stopAllEngines]);
 
-  // Publish this device's presence & playback state to server
+  // Publish this device's presence & playback state to server (debounced so internal URL updates don't spam SSE)
+  const currentTrackId = currentTrack?.id ?? null;
+  const currentTrackTitle = currentTrack?.title ?? null;
   useEffect(() => {
-    void updateDevicePresence({
-      deviceId: deviceIdentity.deviceId,
-      deviceName: deviceIdentity.deviceName,
-      deviceType: deviceIdentity.deviceType,
-      isAdmin,
-      currentTrackTitle: currentTrack ? currentTrack.title : null,
-      isPlaying,
-    });
-  }, [currentTrack, deviceIdentity, isAdmin, isPlaying]);
+    const timer = window.setTimeout(() => {
+      void updateDevicePresence({
+        deviceId: deviceIdentity.deviceId,
+        deviceName: deviceIdentity.deviceName,
+        deviceType: deviceIdentity.deviceType,
+        isAdmin,
+        currentTrackTitle,
+        isPlaying,
+      });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [currentTrackId, currentTrackTitle, deviceIdentity, isAdmin, isPlaying]);
 
   // Native Browser Remote Playback (Chromecast / AirPlay) & Audio Output Routing
   const refreshAudioOutputs = useCallback(async () => {
@@ -1368,6 +2298,7 @@ export default function App() {
     }
 
     if (activeEl.paused) {
+      wantPlayingRef.current = true;
       intentionalPauseRef.current = false;
       if (usesLocalEl) await resumeAudioContextBounded();
       try {
@@ -1379,7 +2310,9 @@ export default function App() {
         await playTrackLocally(currentTrack, activeEl.currentTime || lastPlaybackTimeRef.current || 0);
       }
     } else {
+      wantPlayingRef.current = false;
       intentionalPauseRef.current = true;
+      suppressPauseUntilRef.current = performance.now() + 450;
       clearPlaybackTimers();
       activeEl.pause();
       setIsPlaying(false);
@@ -1439,6 +2372,7 @@ export default function App() {
     if (repeatMode === 'off') {
       const idx = activeQueue.findIndex((t) => t.id === currentTrack?.id);
       if (idx === activeQueue.length - 1 && !isShuffle) {
+        wantPlayingRef.current = false;
         setIsPlaying(false);
         return;
       }
@@ -1472,10 +2406,23 @@ export default function App() {
     if (typeof navigator === 'undefined' || !('mediaSession' in navigator)) return;
     const ms = navigator.mediaSession;
     if (currentTrack && typeof MediaMetadata !== 'undefined') {
+      let artwork: MediaImage[] | undefined;
+      if (currentTrack.coverDataUrl) {
+        let artSrc = currentTrack.coverDataUrl;
+        if (artSrc.startsWith('/')) {
+          try {
+            artSrc = new URL(artSrc, window.location.origin).href;
+          } catch {
+            // keep relative
+          }
+        }
+        artwork = [{ src: artSrc, sizes: '512x512', type: 'image/jpeg' }];
+      }
       ms.metadata = new MediaMetadata({
         title: currentTrack.title,
         artist: currentTrack.artist,
         album: currentTrack.album || 'Aura Audio',
+        ...(artwork ? { artwork } : {}),
       });
     }
     ms.playbackState = isPlaying ? 'playing' : 'paused';
@@ -1516,6 +2463,15 @@ export default function App() {
   // Keyboard shortcuts
   useEffect(() => {
     const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape' && albumShowcaseOpen) {
+        setAlbumShowcaseOpen(false);
+        return;
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'b') {
+        e.preventDefault();
+        setSidebarCollapsed((prev) => !prev);
+        return;
+      }
       const target = e.target as HTMLElement | null;
       if (
         target &&
@@ -1536,29 +2492,177 @@ export default function App() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  });
+  }, [albumShowcaseOpen, currentTime, duration, handleSeek, togglePlayPause]);
 
   // --- File & Folder Direct HDD Sync (Zero Server Upload) ---
+  const publishTracksSequentially = useCallback(
+    async (
+      items: Array<{ track: Track; blob?: Blob }>
+    ) => {
+      if (items.length === 0 || autoPublishingRef.current) return;
+      autoPublishingRef.current = true;
+      let publishedCount = 0;
+      const publishedMap = new Map<string, string>();
+      setAdminTask({
+        state: 'working',
+        message: `กำลังเปิดสตรีมออนไลน์อัตโนมัติทุกเครื่อง (0/${items.length})...`,
+        updatedAt: Date.now(),
+      });
+
+      try {
+        for (let i = 0; i < items.length; i++) {
+          const { track, blob: initialBlob } = items[i];
+          try {
+            let blob: Blob | undefined | null =
+              initialBlob || inMemoryBlobMapRef.current.get(track.id) || (await getLocalBlobFromDb(track.id));
+            if (!blob && track.url.startsWith('blob:')) {
+              blob = await fetch(track.url).then((r) => r.blob()).catch(() => null);
+            }
+            if (!blob || blob.size <= 0 || blob.size > 240 * 1024 * 1024) continue;
+
+            const fname =
+              blob instanceof File ? blob.name : `${track.title}.${track.format.toLowerCase()}`;
+            const created = await publishTrackToServerStream(track, blob, fname);
+            publishedMap.set(track.id, created.id);
+            publishedCount++;
+            void updateLocalTrackMetaInDb({ ...track, publishedStreamId: created.id });
+          } catch {
+            // skip individual publish error
+          }
+          setAdminTask({
+            state: 'working',
+            message: `กำลังเปิดสตรีมออนไลน์อัตโนมัติทุกเครื่อง (${i + 1}/${items.length})...`,
+            updatedAt: Date.now(),
+          });
+        }
+
+        if (publishedMap.size > 0) {
+          setLocalTracks((prev) =>
+            prev.map((t) =>
+              publishedMap.has(t.id)
+                ? { ...t, publishedStreamId: publishedMap.get(t.id) }
+                : t
+            )
+          );
+          await refreshServerStreams();
+          await refreshAdminStatus();
+          setAdminTask({
+            state: 'done',
+            message: `เปิดสตรีมออนไลน์อัตโนมัติ ${publishedCount} เพลงไปยังทุกเครื่องแล้ว`,
+            updatedAt: Date.now(),
+          });
+          showStatus(`เปิดสตรีมออนไลน์อัตโนมัติให้ทุกเครื่อง ${publishedCount} เพลงเรียบร้อย`);
+        } else {
+          setAdminTask({
+            state: 'idle',
+            message: 'ระบบพร้อมทำงานปกติ',
+            updatedAt: Date.now(),
+          });
+        }
+      } finally {
+        autoPublishingRef.current = false;
+      }
+    },
+    [refreshAdminStatus, refreshServerStreams, showStatus]
+  );
+
+  // Auto-resume / auto-heal pending Admin online streams after refresh or container restart
+  useEffect(() => {
+    if (
+      !authReady ||
+      !isAdmin ||
+      !serverStreamsLoaded ||
+      prefs.autoStreamOnAdd === false ||
+      autoPublishingRef.current ||
+      localTracks.length === 0
+    ) {
+      return;
+    }
+
+    const existingServerIds = new Set(serverStreams.map((t) => t.id));
+    const existingServerKeys = new Set(
+      serverStreams.map((t) => `${t.title.toLowerCase()}::${t.sizeBytes || 0}`)
+    );
+
+    const pending = localTracks.filter((t) => {
+      if (t.publishedStreamId && existingServerIds.has(t.publishedStreamId)) return false;
+      const key = `${t.title.toLowerCase()}::${t.sizeBytes || 0}`;
+      if (existingServerKeys.has(key)) return false;
+      return Boolean(t.url) || inMemoryBlobMapRef.current.has(t.id);
+    });
+
+    if (pending.length > 0) {
+      void publishTracksSequentially(pending.map((track) => ({ track })));
+    }
+  }, [
+    authReady,
+    isAdmin,
+    localTracks,
+    prefs.autoStreamOnAdd,
+    publishTracksSequentially,
+    serverStreams,
+    serverStreamsLoaded,
+  ]);
+
   const syncFilesIntoLibrary = useCallback(
     async (
-      entries: Array<{ file: File; relativePath?: string }>,
+      entries: Array<{ file: File; relativePath?: string; fileHandle?: FileSystemFileHandle }>,
       options?: {
         folderName?: string;
         folderMode?: 'handle' | 'directory-input';
         targetTab?: LibraryTab;
+        silent?: boolean;
       }
     ) => {
-      const audioEntries: Array<{ file: File; relativePath?: string }> = [];
+      const audioEntries: Array<{ file: File; relativePath?: string; fileHandle?: FileSystemFileHandle }> = [];
       const playlistFiles: File[] = [];
+      const folderCoverCandidates = new Map<string, { file: File; priority: number }>();
 
       for (const item of entries) {
         const ext = getFileExtension(item.file.name);
         if (ext === 'm3u' || ext === 'm3u8') {
           playlistFiles.push(item.file);
+        } else if (isCoverImageFilename(item.file.name)) {
+          const relPath =
+            (
+              item.relativePath ||
+              ((item.file as File & { webkitRelativePath?: string }).webkitRelativePath || '').trim() ||
+              item.file.name
+            ).replace(/\\/g, '/');
+          const lastSlash = relPath.lastIndexOf('/');
+          const dirKey = lastSlash > 0 ? relPath.slice(0, lastSlash) : '__root__';
+          const priority = getCoverImagePriority(item.file.name);
+          const existing = folderCoverCandidates.get(dirKey);
+          if (!existing || priority < existing.priority) {
+            folderCoverCandidates.set(dirKey, { file: item.file, priority });
+          }
         } else if (isSupportedAudioFile(item.file)) {
           audioEntries.push(item);
         }
       }
+
+      const folderCoverDataUrls = new Map<string, string>();
+      if (folderCoverCandidates.size > 0) {
+        await Promise.all(
+          Array.from(folderCoverCandidates.entries()).map(async ([dirKey, { file }]) => {
+            const dataUrl = await extractCoverFromImageFile(file, 512);
+            if (dataUrl) folderCoverDataUrls.set(dirKey, dataUrl);
+          })
+        );
+      }
+
+      const resolveFolderCover = (relPath: string): string | undefined => {
+        const normalized = relPath.replace(/\\/g, '/');
+        let cursor = normalized.lastIndexOf('/') > 0 ? normalized.slice(0, normalized.lastIndexOf('/')) : '__root__';
+        while (true) {
+          const hit = folderCoverDataUrls.get(cursor);
+          if (hit) return hit;
+          if (cursor === '__root__') break;
+          const parentSlash = cursor.lastIndexOf('/');
+          cursor = parentSlash > 0 ? cursor.slice(0, parentSlash) : '__root__';
+        }
+        return undefined;
+      };
 
       if (playlistFiles.length > 0 && isAdmin) {
         let importedCount = 0;
@@ -1585,14 +2689,14 @@ export default function App() {
           await refreshServerStreams();
           await refreshAdminStatus();
           showStatus(`นำเข้าลิงก์สตรีม ${importedCount} รายการเข้าคลังกลางแล้ว`);
-          if (firstImported && audioEntries.length === 0) {
-            playTrack(firstImported);
+          if (firstImported && audioEntries.length === 0 && !isPlayingRef.current) {
+            void playTrack(firstImported);
           }
         }
       }
 
       if (audioEntries.length === 0) {
-        if (playlistFiles.length === 0) {
+        if (playlistFiles.length === 0 && !options?.silent) {
           showStatus('ไม่พบไฟล์เสียงที่รองรับในโฟลเดอร์หรือรายการที่เลือก');
         }
         return;
@@ -1607,41 +2711,57 @@ export default function App() {
           return rel.includes('/') ? rel.split('/')[0] : undefined;
         })();
 
-      setHddSyncProgress({
-        label: inferredFolder ? `กำลังซิงค์โฟลเดอร์ "${inferredFolder}"` : 'กำลังซิงค์ไฟล์จาก HDD',
-        processed: 0,
-        total: audioEntries.length,
-      });
+      if (!options?.silent) {
+        setHddSyncProgress({
+          label: inferredFolder ? `กำลังซิงค์โฟลเดอร์ "${inferredFolder}"` : 'กำลังซิงค์ไฟล์จาก HDD',
+          processed: 0,
+          total: audioEntries.length,
+        });
+      }
 
-      const existingById = new Map(localTracks.map((t) => [t.id, t]));
+      const existingById = new Map(localTracksRef.current.map((t) => [t.id, t]));
+      const existingByPathSize = new Map(
+        localTracksRef.current
+          .filter((t) => t.relativePath && typeof t.sizeBytes === 'number')
+          .map((t) => [`${t.relativePath}::${t.sizeBytes}`, t])
+      );
       const syncedTracks: Track[] = [];
-      const dbQueue: Array<{ track: Track; blob: Blob }> = [];
-      const fastMode = audioEntries.length > 3;
+      const dbQueue: LocalDbSaveItem[] = [];
+      const pendingCoverBackfill: Array<{ track: Track; file: File; fallbackCover?: string }> = [];
+      const fastMode = audioEntries.length > 20;
       const BATCH_SIZE = 16;
 
       try {
         for (let i = 0; i < audioEntries.length; i += BATCH_SIZE) {
           const batch = audioEntries.slice(i, i + BATCH_SIZE);
           const parsedBatch = await Promise.all(
-            batch.map(async ({ file, relativePath }) => {
+            batch.map(async ({ file, relativePath, fileHandle }) => {
               try {
                 const relPath =
                   relativePath ||
                   ((file as File & { webkitRelativePath?: string }).webkitRelativePath || '').trim() ||
                   file.name;
+                const fallbackCover = resolveFolderCover(relPath);
                 const deterministicSeed = hashStringToSeed(
                   `${ownerKey}:${relPath}:${file.size}:${file.lastModified}`
                 );
                 const candidateId = `local-${deterministicSeed.toString(36)}-${file.size.toString(36)}`;
-                const cached = existingById.get(candidateId);
+                const cached =
+                  existingById.get(candidateId) ||
+                  existingByPathSize.get(`${relPath}::${file.size}`);
 
                 let track: Track;
                 if (cached) {
                   const syncedFolder = inferredFolder || cached.syncedFolder;
+                  let coverDataUrl = cached.coverDataUrl;
+                  if (!coverDataUrl && !fastMode) {
+                    coverDataUrl = (await extractCoverFromAudioBlob(file, 512)) || fallbackCover;
+                  }
                   track = {
                     ...cached,
-                    url: URL.createObjectURL(file),
-                    addedAt: Date.now(),
+                    ...(coverDataUrl ? { coverDataUrl } : {}),
+                    url: cached.url && cached.url.startsWith('blob:') ? cached.url : URL.createObjectURL(file),
+                    addedAt: cached.addedAt || Date.now(),
                     relativePath: relPath,
                     syncedFolder,
                     folderName:
@@ -1652,11 +2772,20 @@ export default function App() {
                     relativePath: relPath,
                     syncedFolder: inferredFolder,
                     fastMode,
+                    fallbackCoverDataUrl: fallbackCover,
+                  });
+                }
+
+                if (!track.coverDataUrl) {
+                  pendingCoverBackfill.push({
+                    track,
+                    file,
+                    fallbackCover,
                   });
                 }
 
                 inMemoryBlobMapRef.current.set(track.id, file);
-                dbQueue.push({ track, blob: file });
+                dbQueue.push({ track, blob: file, fileHandle });
                 return track;
               } catch {
                 return null;
@@ -1666,40 +2795,51 @@ export default function App() {
           for (const item of parsedBatch) {
             if (item) syncedTracks.push(item);
           }
-          setHddSyncProgress({
-            label: inferredFolder
-              ? `กำลังซิงค์โฟลเดอร์ "${inferredFolder}"`
-              : 'กำลังซิงค์ไฟล์จาก HDD',
-            processed: Math.min(i + batch.length, audioEntries.length),
-            total: audioEntries.length,
-          });
+          if (!options?.silent) {
+            setHddSyncProgress({
+              label: inferredFolder
+                ? `กำลังซิงค์โฟลเดอร์ "${inferredFolder}"`
+                : 'กำลังซิงค์ไฟล์จาก HDD',
+              processed: Math.min(i + batch.length, audioEntries.length),
+              total: audioEntries.length,
+            });
+          }
           await new Promise<void>((resolve) => window.setTimeout(resolve, 0));
         }
       } finally {
-        setHddSyncProgress(null);
+        if (!options?.silent) {
+          setHddSyncProgress(null);
+        }
       }
 
       if (syncedTracks.length > 0) {
         const urlsToRevoke: string[] = [];
+        const syncedMap = new Map(syncedTracks.map((t) => [t.id, t]));
         setLocalTracks((prev) => {
-          const incomingIds = new Set(syncedTracks.map((t) => t.id));
           const preserved = prev.filter((t) => {
-            if (!incomingIds.has(t.id)) return true;
-            if (t.url.startsWith('blob:')) urlsToRevoke.push(t.url);
+            const replacement = syncedMap.get(t.id);
+            if (!replacement) return true;
+            if (t.url.startsWith('blob:') && t.url !== replacement.url) {
+              urlsToRevoke.push(t.url);
+            }
             return false;
           });
           return [...syncedTracks, ...preserved];
         });
 
-        // Delay revoking replaced blob URLs so active audio element transitions smoothly
+        // Delay revoking replaced blob URLs and never revoke the currently active audio URL
         if (urlsToRevoke.length > 0) {
           window.setTimeout(() => {
             for (const oldUrl of urlsToRevoke) {
-              if (localAudioRef.current?.src !== oldUrl) {
+              if (
+                localAudioRef.current?.src !== oldUrl &&
+                remoteAudioRef.current?.src !== oldUrl &&
+                currentTrackRef.current?.url !== oldUrl
+              ) {
                 URL.revokeObjectURL(oldUrl);
               }
             }
-          }, 8000);
+          }, 10000);
         }
 
         if (inferredFolder) {
@@ -1716,87 +2856,77 @@ export default function App() {
           updatePrefs((prev) => ({ ...prev, includeHddInStream: true }));
         }
 
-        if (activeTab === 'admin') {
-          setActiveTab('local');
-        } else if (options?.targetTab && activeTab !== 'all') {
-          setActiveTab(options.targetTab);
+        // Persist metadata + fileHandles immediately before returning so refreshing never drops tracks
+        await saveLocalTracksMetaFirstToDb(dbQueue);
+
+        if (!options?.silent) {
+          if (activeTab === 'admin') {
+            setActiveTab('local');
+          } else if (options?.targetTab && activeTab !== 'all') {
+            setActiveTab(options.targetTab);
+          }
+
+          showStatus(
+            inferredFolder
+              ? `ซิงค์โฟลเดอร์ "${inferredFolder}" สำเร็จ ${syncedTracks.length} เพลง — บันทึกคลังเรียบร้อย`
+              : `เพิ่มเพลงจาก HDD ${syncedTracks.length} เพลง — บันทึกคลังเรียบร้อย`
+          );
+
+          // Only auto-start playback if nothing is currently playing so we don't cut off an active song
+          if (!currentTrackRef.current || (!isPlayingRef.current && !wantPlayingRef.current)) {
+            void playTrack(syncedTracks[0]);
+          }
         }
 
-        const shouldAutoPublish = isAdmin && prefs.autoStreamOnAdd !== false;
-        showStatus(
-          inferredFolder
-            ? `ซิงค์โฟลเดอร์ "${inferredFolder}" สำเร็จ ${syncedTracks.length} เพลง — กำลังสตรีมออนไลน์ทันที`
-            : `เพิ่มเพลงจาก HDD ${syncedTracks.length} เพลง — กำลังสตรีมออนไลน์ทันที`
-        );
-        void playTrack(syncedTracks[0]);
-
-        // Persist eligible caches asynchronously in background without blocking sync UI
+        // Persist audio blobs asynchronously in background
         void saveLocalTracksBatchToDb(dbQueue);
 
-        // If Admin & autoStreamOnAdd enabled, auto-publish new tracks sequentially so server is never overloaded
+        // Extract remaining album covers in background when syncing large batches (> 20 tracks)
+        if (pendingCoverBackfill.length > 0) {
+          void (async () => {
+            for (let i = 0; i < pendingCoverBackfill.length; i += 4) {
+              const chunk = pendingCoverBackfill.slice(i, i + 4);
+              const coverMap = new Map<string, string>();
+              await Promise.all(
+                chunk.map(async ({ track, file, fallbackCover }) => {
+                  const coverDataUrl =
+                    (await extractCoverFromAudioBlob(file, 512)) || fallbackCover;
+                  if (coverDataUrl) {
+                    coverMap.set(track.id, coverDataUrl);
+                    await updateLocalTrackMetaInDb({ ...track, coverDataUrl });
+                  }
+                })
+              );
+              if (coverMap.size > 0) {
+                setLocalTracks((prev) =>
+                  prev.map((t) => {
+                    const cov = coverMap.get(t.id);
+                    return cov && !t.coverDataUrl ? { ...t, coverDataUrl: cov } : t;
+                  })
+                );
+              }
+              await new Promise<void>((resolve) => window.setTimeout(resolve, 16));
+            }
+          })();
+        }
+
+        // If Admin & autoStreamOnAdd enabled, auto-publish new tracks sequentially
+        const shouldAutoPublish = isAdmin && prefs.autoStreamOnAdd !== false;
         if (shouldAutoPublish) {
+          const existingServerIds = new Set(serverStreamsRef.current.map((t) => t.id));
           const existingServerKeys = new Set(
-            serverStreams.map((t) => `${t.title.toLowerCase()}::${t.sizeBytes || 0}`)
+            serverStreamsRef.current.map((t) => `${t.title.toLowerCase()}::${t.sizeBytes || 0}`)
           );
-          const MAX_AUTO_PUBLISH_BYTES = 80 * 1024 * 1024;
+          const MAX_AUTO_PUBLISH_BYTES = 240 * 1024 * 1024;
           const toPublish = dbQueue.filter(({ track, blob }) => {
             if (blob.size <= 0 || blob.size > MAX_AUTO_PUBLISH_BYTES) return false;
+            if (track.publishedStreamId && existingServerIds.has(track.publishedStreamId)) return false;
             const key = `${track.title.toLowerCase()}::${track.sizeBytes || 0}`;
             return !existingServerKeys.has(key);
           });
 
           if (toPublish.length > 0) {
-            void (async () => {
-              let publishedCount = 0;
-              const publishedMap = new Map<string, string>();
-              setAdminTask({
-                state: 'working',
-                message: `กำลังเปิดสตรีมออนไลน์อัตโนมัติทุกเครื่อง (0/${toPublish.length})...`,
-                updatedAt: Date.now(),
-              });
-
-              for (let i = 0; i < toPublish.length; i++) {
-                const { track, blob } = toPublish[i];
-                try {
-                  const fname =
-                    blob instanceof File ? blob.name : `${track.title}.${track.format.toLowerCase()}`;
-                  const created = await publishTrackToServerStream(track, blob, fname);
-                  publishedMap.set(track.id, created.id);
-                  publishedCount++;
-                } catch {
-                  // skip individual publish error
-                }
-                setAdminTask({
-                  state: 'working',
-                  message: `กำลังเปิดสตรีมออนไลน์อัตโนมัติทุกเครื่อง (${i + 1}/${toPublish.length})...`,
-                  updatedAt: Date.now(),
-                });
-              }
-
-              if (publishedMap.size > 0) {
-                setLocalTracks((prev) =>
-                  prev.map((t) =>
-                    publishedMap.has(t.id)
-                      ? { ...t, publishedStreamId: publishedMap.get(t.id) }
-                      : t
-                  )
-                );
-                await refreshServerStreams();
-                await refreshAdminStatus();
-                setAdminTask({
-                  state: 'done',
-                  message: `เปิดสตรีมออนไลน์อัตโนมัติ ${publishedCount} เพลงไปยังทุกเครื่องแล้ว`,
-                  updatedAt: Date.now(),
-                });
-                showStatus(`เปิดสตรีมออนไลน์อัตโนมัติให้ทุกเครื่อง ${publishedCount} เพลงเรียบร้อย`);
-              } else {
-                setAdminTask({
-                  state: 'idle',
-                  message: 'ระบบพร้อมทำงานปกติ',
-                  updatedAt: Date.now(),
-                });
-              }
-            })();
+            void publishTracksSequentially(toPublish.map(({ track, blob }) => ({ track, blob })));
           }
         }
       }
@@ -1804,14 +2934,13 @@ export default function App() {
     [
       activeTab,
       isAdmin,
-      localTracks,
       ownerKey,
       playTrack,
       prefs.autoStreamOnAdd,
       prefs.includeHddInStream,
+      publishTracksSequentially,
       refreshAdminStatus,
       refreshServerStreams,
-      serverStreams,
       showStatus,
       updatePrefs,
     ]
@@ -1860,7 +2989,7 @@ export default function App() {
     async (
       dirHandle: FileSystemDirectoryHandle,
       maxFiles = 2000
-    ): Promise<Array<{ file: File; relativePath: string }>> => {
+    ): Promise<Array<{ file: File; relativePath: string; fileHandle: FileSystemFileHandle }>> => {
       const pendingHandles: Array<{ handle: FileSystemFileHandle; relativePath: string }> = [];
       const walk = async (handle: FileSystemDirectoryHandle, prefix: string) => {
         if (pendingHandles.length >= maxFiles) return;
@@ -1872,7 +3001,7 @@ export default function App() {
           if (entry.name.startsWith('.')) continue;
           const entryPath = `${prefix}/${entry.name}`;
           if (entry.kind === 'file') {
-            if (isSupportedAudioFilename(entry.name)) {
+            if (isSupportedAudioFilename(entry.name) || isCoverImageFilename(entry.name)) {
               pendingHandles.push({
                 handle: entry as FileSystemFileHandle,
                 relativePath: entryPath,
@@ -1891,7 +3020,7 @@ export default function App() {
 
       await walk(dirHandle, dirHandle.name);
 
-      const files: Array<{ file: File; relativePath: string }> = [];
+      const files: Array<{ file: File; relativePath: string; fileHandle: FileSystemFileHandle }> = [];
       const GET_FILE_BATCH = 24;
       for (let i = 0; i < pendingHandles.length; i += GET_FILE_BATCH) {
         const chunk = pendingHandles.slice(i, i + GET_FILE_BATCH);
@@ -1901,6 +3030,7 @@ export default function App() {
               return {
                 file: await handle.getFile(),
                 relativePath,
+                fileHandle: handle,
               };
             } catch {
               return null;
@@ -1915,6 +3045,42 @@ export default function App() {
     },
     []
   );
+
+  // Auto-hydrate local tracks from granted HDD directory handles after page refresh
+  useEffect(() => {
+    if (!authReady || savedHddHandles.length === 0) return;
+    let cancelled = false;
+    const autoHydrate = async () => {
+      for (const rec of savedHddHandles) {
+        if (cancelled || autoReconnectedIdsRef.current.has(rec.id)) continue;
+        try {
+          const handleWithPerm = rec.handle as unknown as {
+            queryPermission?: (opts: { mode: 'read' }) => Promise<PermissionState>;
+          };
+          const perm = handleWithPerm.queryPermission
+            ? await handleWithPerm.queryPermission({ mode: 'read' })
+            : 'granted';
+          if (perm === 'granted') {
+            autoReconnectedIdsRef.current.add(rec.id);
+            const entries = await collectAudioFilesFromDirHandle(rec.handle);
+            if (!cancelled && entries.length > 0) {
+              await syncFilesIntoLibrary(entries, {
+                folderName: rec.name,
+                folderMode: 'handle',
+                silent: true,
+              });
+            }
+          }
+        } catch {
+          // ignore auto-hydrate error until user interacts
+        }
+      }
+    };
+    void autoHydrate();
+    return () => {
+      cancelled = true;
+    };
+  }, [authReady, collectAudioFilesFromDirHandle, savedHddHandles, syncFilesIntoLibrary]);
 
   const handlePickBrowserHddFolder = useCallback(() => {
     let inIframe = false;
@@ -2070,6 +3236,7 @@ export default function App() {
         }
         if (track.url.startsWith('blob:')) URL.revokeObjectURL(track.url);
         inMemoryBlobMapRef.current.delete(track.id);
+        remoteBlobCacheRef.current.delete(track.id);
         await deleteLocalTrackFromDb(track.id);
         setLocalTracks((prev) => prev.filter((t) => t.id !== track.id));
         showStatus(`ลบไฟล์ "${track.title}" ออกจากเครื่องนี้แล้ว`);
@@ -2084,6 +3251,7 @@ export default function App() {
           updatedAt: Date.now(),
         });
         await deleteServerStream(track.id);
+        remoteBlobCacheRef.current.delete(track.id);
         if (currentTrack?.id === track.id) {
           stopAllEngines();
           setIsPlaying(false);
@@ -2285,6 +3453,7 @@ export default function App() {
       if (t.url.startsWith('blob:')) URL.revokeObjectURL(t.url);
     }
     inMemoryBlobMapRef.current.clear();
+    remoteBlobCacheRef.current.clear();
     await clearLocalTracksFromDb(ownerKey);
     clearSyncedFolderSummaries(ownerKey);
     setLocalTracks([]);
@@ -2310,6 +3479,7 @@ export default function App() {
       if (t.url.startsWith('blob:')) URL.revokeObjectURL(t.url);
     }
     inMemoryBlobMapRef.current.clear();
+    remoteBlobCacheRef.current.clear();
 
     await Promise.all([clearLocalTracksFromDb(ownerKey), clearHddHandlesFromDb(ownerKey)]);
     clearSyncedFolderSummaries(ownerKey);
@@ -2331,7 +3501,12 @@ export default function App() {
         updatedAt: Date.now(),
       });
       await apiResetServerData();
-      await Promise.all([refreshServerStreams(), refreshAdminStatus()]);
+      const scope = getServerBaseUrl() || 'origin';
+      serverCatalogVersionRef.current = '';
+      serverCoverCacheMapRef.current.clear();
+      clearCachedServerLibrary(scope);
+      await clearCachedStreamMedia(scope);
+      await Promise.all([refreshServerStreams(true), refreshAdminStatus()]);
       setAdminTask({
         state: 'done',
         message: 'รีเซ็ตข้อมูลคลังกลางและโฟลเดอร์ HDD โฮสต์ทั้งหมดแล้ว',
@@ -2352,6 +3527,281 @@ export default function App() {
         : 'รีเซ็ตข้อมูลในเครื่องนี้เรียบร้อยแล้ว'
     );
   };
+
+  // --- Local Network (LAN P2P) Manager & Handlers ---
+  useEffect(() => {
+    isSharingLanRef.current = isSharingLan;
+  }, [isSharingLan]);
+
+  useEffect(() => {
+    const manager = new LanP2PManager({
+      getIdentity: () => deviceIdentityRef.current,
+      resolveLocalBlob: async (trackId) => {
+        const mem = inMemoryBlobMapRef.current.get(trackId);
+        if (mem) return mem;
+
+        const dbBlob = await getLocalBlobFromDb(trackId);
+        if (dbBlob) {
+          inMemoryBlobMapRef.current.set(trackId, dbBlob);
+          return dbBlob;
+        }
+
+        const localMatch = localTracksRef.current.find((t) => t.id === trackId);
+        if (localMatch?.url && localMatch.url.startsWith('blob:')) {
+          try {
+            const fetched = await fetch(localMatch.url).then((r) => (r.ok ? r.blob() : null));
+            if (fetched) {
+              inMemoryBlobMapRef.current.set(trackId, fetched);
+              return fetched;
+            }
+          } catch {
+            // ignore stale blob
+          }
+        }
+
+        const serverMatch = serverStreamsRef.current.find((t) => t.id === trackId);
+        if (serverMatch) {
+          const url = resolveTrackPlayableUrl(serverMatch.streamUrl || serverMatch.url);
+          if (url) {
+            try {
+              const fetched = await fetch(url).then((r) => (r.ok ? r.blob() : null));
+              if (fetched) {
+                inMemoryBlobMapRef.current.set(trackId, fetched);
+                return fetched;
+              }
+            } catch {
+              // ignore fetch failure
+            }
+          }
+        }
+
+        return null;
+      },
+      resolveLocalCover: async (trackId) => {
+        const localMatch = localTracksRef.current.find((t) => t.id === trackId);
+        if (localMatch?.coverDataUrl?.startsWith('data:image/')) {
+          return localMatch.coverDataUrl;
+        }
+        const blob =
+          inMemoryBlobMapRef.current.get(trackId) || (await getLocalBlobFromDb(trackId));
+        if (blob) {
+          const extracted = await extractCoverFromAudioBlob(blob, 512);
+          if (extracted) {
+            if (localMatch) {
+              const updatedTrack = { ...localMatch, coverDataUrl: extracted };
+              setLocalTracks((prev) =>
+                prev.map((t) => (t.id === trackId && !t.coverDataUrl ? updatedTrack : t))
+              );
+              void updateLocalTrackMetaInDb(updatedTrack);
+            }
+            return extracted;
+          }
+        }
+        const serverMatch = serverStreamsRef.current.find((t) => t.id === trackId);
+        if (serverMatch?.coverDataUrl) {
+          if (serverMatch.coverDataUrl.startsWith('data:image/')) {
+            return serverMatch.coverDataUrl;
+          }
+          try {
+            const res = await fetch(serverMatch.coverDataUrl);
+            if (res.ok) {
+              const imgBlob = await res.blob();
+              const dataUrl = await resizeImageBlobToDataUrl(imgBlob, 512);
+              if (dataUrl) return dataUrl;
+            }
+          } catch {
+            // ignore
+          }
+        }
+        return null;
+      },
+      onPeerCountChange: (count) => {
+        setLanPeerCount(count);
+      },
+    });
+
+    lanP2pRef.current = manager;
+    lanSignalHandlerRef.current = (signal) => {
+      void manager.handleSignal(signal);
+    };
+
+    return () => {
+      manager.closeAll();
+      lanP2pRef.current = null;
+      if (isSharingLanRef.current) {
+        void unregisterLanHost(deviceIdentityRef.current.deviceId);
+      }
+    };
+  }, []);
+
+  const buildLanSharedMetadata = useCallback((): LanSharedTrackMeta[] => {
+    let inlineCoverBudget = 600 * 1024;
+    let inlineCoverCount = 0;
+    return localTracksRef.current.map((t) => {
+      const hasCover = Boolean(t.coverDataUrl);
+      let inlineCover: string | undefined;
+      if (
+        t.coverDataUrl &&
+        t.coverDataUrl.startsWith('data:image/') &&
+        inlineCoverCount < 20 &&
+        t.coverDataUrl.length < inlineCoverBudget
+      ) {
+        inlineCover = t.coverDataUrl;
+        inlineCoverBudget -= t.coverDataUrl.length;
+        inlineCoverCount++;
+      }
+      return {
+        id: t.id,
+        title: t.title,
+        artist: t.artist,
+        album: t.album,
+        genre: t.genre,
+        folderName: t.folderName || t.syncedFolder,
+        format: t.format,
+        formatDetail: t.formatDetail,
+        isLossless: t.isLossless,
+        durationSec: t.durationSec,
+        durationLabel: t.durationLabel,
+        ...(inlineCover ? { coverDataUrl: inlineCover } : {}),
+        ...(hasCover ? { hasCover: true } : {}),
+        coverSeed: t.coverSeed,
+        addedAt: t.addedAt,
+        sizeBytes: t.sizeBytes,
+        sampleRate: t.sampleRate,
+        bitrate: t.bitrate,
+      };
+    });
+  }, []);
+
+  // Keep shared LAN track list synced when local tracks or device identity changes
+  useEffect(() => {
+    if (!isSharingLan) return;
+    const timer = window.setTimeout(() => {
+      void registerLanHost({
+        deviceId: deviceIdentity.deviceId,
+        deviceName: deviceIdentity.deviceName,
+        deviceType: deviceIdentity.deviceType,
+        tracks: buildLanSharedMetadata(),
+      })
+        .then((hosts) => setLanHosts(hosts))
+        .catch(() => {});
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [buildLanSharedMetadata, deviceIdentity, isSharingLan, localTracks]);
+
+  // Keep LAN host alive with 20s heartbeat + automatic re-register on SSE reconnect or tab resume
+  useEffect(() => {
+    if (!isSharingLan) return;
+
+    const sendHeartbeatOrReregister = async () => {
+      const ok = await heartbeatLanHost(deviceIdentityRef.current.deviceId);
+      if (!ok && isSharingLanRef.current) {
+        try {
+          const hosts = await registerLanHost({
+            deviceId: deviceIdentityRef.current.deviceId,
+            deviceName: deviceIdentityRef.current.deviceName,
+            deviceType: deviceIdentityRef.current.deviceType,
+            tracks: buildLanSharedMetadata(),
+          });
+          setLanHosts(hosts);
+        } catch {
+          // retry on next interval
+        }
+      }
+    };
+
+    if (syncState === 'connected') {
+      void sendHeartbeatOrReregister();
+    }
+
+    const interval = window.setInterval(() => {
+      void sendHeartbeatOrReregister();
+    }, 20000);
+
+    const handleVisible = () => {
+      if (document.visibilityState === 'visible') {
+        void sendHeartbeatOrReregister();
+        void fetchLanHosts().then((hosts) => setLanHosts(hosts));
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisible);
+
+    return () => {
+      window.clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisible);
+    };
+  }, [buildLanSharedMetadata, isSharingLan, syncState]);
+
+  const handleToggleShareLan = useCallback(async () => {
+    setSharingLanBusy(true);
+    try {
+      if (isSharingLan) {
+        const hosts = await unregisterLanHost(deviceIdentity.deviceId);
+        setLanHosts(hosts);
+        setIsSharingLan(false);
+        showStatus('หยุดแชร์เพลงในวง Local Network แล้ว');
+      } else {
+        const meta = buildLanSharedMetadata();
+        if (meta.length === 0) {
+          throw new Error('กรุณาเพิ่มไฟล์หรือซิงค์โฟลเดอร์เพลงในเครื่องก่อนเปิดแชร์ในวง LAN');
+        }
+        const hosts = await registerLanHost({
+          deviceId: deviceIdentity.deviceId,
+          deviceName: deviceIdentity.deviceName,
+          deviceType: deviceIdentity.deviceType,
+          tracks: meta,
+        });
+        setLanHosts(hosts);
+        setIsSharingLan(true);
+        showStatus(`เปิดแชร์ ${meta.length} เพลงในวง Local Network (ไม่อัปโหลดขึ้นเซิร์ฟเวอร์) แล้ว`);
+      }
+    } finally {
+      setSharingLanBusy(false);
+    }
+  }, [buildLanSharedMetadata, deviceIdentity, isSharingLan, showStatus]);
+
+  const handleRefreshLanHosts = useCallback(async () => {
+    const hosts = await fetchLanHosts();
+    setLanHosts(hosts);
+  }, []);
+
+  const handleConnectLanHost = useCallback(
+    async (host: LanHostInfo) => {
+      setConnectingLanHostId(host.deviceId);
+      try {
+        if (lanP2pRef.current) {
+          await lanP2pRef.current.connectToHost(host.deviceId);
+        }
+        desiredLanHostIdsRef.current.add(host.deviceId);
+        lanHostMissingSinceRef.current.delete(host.deviceId);
+        setConnectedLanHostIds((prev) =>
+          prev.includes(host.deviceId) ? prev : [...prev, host.deviceId]
+        );
+        setActiveTab('lan');
+        setLanModalOpen(false);
+        showStatus(`เชื่อมต่อวง LAN กับ "${host.deviceName}" (${host.trackCount} เพลง) แล้ว`);
+      } finally {
+        setConnectingLanHostId(null);
+      }
+    },
+    [showStatus]
+  );
+
+  const handleDisconnectLanHost = useCallback(
+    (hostDeviceId: string) => {
+      desiredLanHostIdsRef.current.delete(hostDeviceId);
+      lanHostMissingSinceRef.current.delete(hostDeviceId);
+      lanP2pRef.current?.closePeer(hostDeviceId);
+      setConnectedLanHostIds((prev) => prev.filter((id) => id !== hostDeviceId));
+      if (currentTrack?.source === 'lan' && currentTrack.lanHostDeviceId === hostDeviceId) {
+        stopAllEngines();
+        setIsPlaying(false);
+        setIsBuffering(false);
+      }
+      showStatus('ตัดการเชื่อมต่อเครื่องในวง Local Network แล้ว');
+    },
+    [currentTrack, showStatus, stopAllEngines]
+  );
 
   // --- Equalizer Handlers ---
   const handleSelectEqPreset = (preset: EqPresetKey) => {
@@ -2388,12 +3838,18 @@ export default function App() {
       };
     }
     if (activeTab === 'all') {
-      return { title: 'คลังเพลงทั้งหมด', sub: 'สตรีมกลางทุกเครื่อง & ไฟล์ในเครื่องนี้' };
+      return { title: 'คลังเพลงทั้งหมด', sub: 'สตรีมกลางทุกเครื่อง, วง LAN และไฟล์ในเครื่องนี้' };
     }
     if (activeTab === 'stream') {
       return {
         title: 'สตรีมเพลงออนไลน์',
         sub: 'เพลงชุดเดียวกันสำหรับทุกอุปกรณ์ที่เชื่อมต่อ',
+      };
+    }
+    if (activeTab === 'lan') {
+      return {
+        title: 'ฟังผ่าน Local Network (LAN / Wi-Fi)',
+        sub: 'รับเสียงโดยตรงจากอุปกรณ์อื่นในวง Wi-Fi เดียวกันแบบ P2P ไม่อัปโหลดขึ้นเซิร์ฟเวอร์',
       };
     }
     if (activeTab === 'local') {
@@ -2422,6 +3878,18 @@ export default function App() {
     !currentTrack.url.includes('/api/hdd/');
 
   const isCurrentFav = currentTrack ? prefs.favorites.includes(currentTrack.id) : false;
+
+  const resolvedCurrentTrack = useMemo(() => {
+    if (!currentTrack) return null;
+    const latest = allTracks.find((t) => t.id === currentTrack.id);
+    if (!latest) return currentTrack;
+    return latest.coverDataUrl && latest.coverDataUrl !== currentTrack.coverDataUrl
+      ? { ...currentTrack, coverDataUrl: latest.coverDataUrl }
+      : currentTrack;
+  }, [allTracks, currentTrack]);
+
+  const showcaseTrack = resolvedCurrentTrack || displayedTracks[0] || allTracks[0] || null;
+  const isShowcaseFav = showcaseTrack ? prefs.favorites.includes(showcaseTrack.id) : false;
 
   return (
     <div className="h-dvh flex flex-col bg-background text-foreground">
@@ -2465,21 +3933,21 @@ export default function App() {
         onWaiting={() => {
           if (activeEngineRef.current !== 'local') return;
           setIsBuffering(true);
-          if (stallTimerRef.current === null && isPlayingRef.current) {
+          if (stallTimerRef.current === null && (isPlayingRef.current || wantPlayingRef.current)) {
             stallTimerRef.current = window.setTimeout(() => {
               stallTimerRef.current = null;
-              if (activeEngineRef.current === 'local' && isPlayingRef.current) {
+              if (activeEngineRef.current === 'local' && (isPlayingRef.current || wantPlayingRef.current)) {
                 attemptRecoveryRef.current('stalled');
               }
             }, 8000);
           }
         }}
         onStalled={() => {
-          if (activeEngineRef.current !== 'local' || !isPlayingRef.current) return;
+          if (activeEngineRef.current !== 'local' || (!isPlayingRef.current && !wantPlayingRef.current)) return;
           if (stallTimerRef.current === null) {
             stallTimerRef.current = window.setTimeout(() => {
               stallTimerRef.current = null;
-              if (activeEngineRef.current === 'local' && isPlayingRef.current) {
+              if (activeEngineRef.current === 'local' && (isPlayingRef.current || wantPlayingRef.current)) {
                 attemptRecoveryRef.current('stalled');
               }
             }, 7000);
@@ -2498,13 +3966,20 @@ export default function App() {
         }}
         onPause={(e) => {
           if (activeEngineRef.current !== 'local') return;
-          if (!e.currentTarget.ended && !intentionalPauseRef.current && isPlayingRef.current) {
+          if (intentionalPauseRef.current || performance.now() < suppressPauseUntilRef.current) return;
+          if (!e.currentTarget.ended && (isPlayingRef.current || wantPlayingRef.current)) {
             setIsPlaying(false);
           }
         }}
         onError={() => {
-          if (activeEngineRef.current !== 'local' || intentionalPauseRef.current) return;
-          if (isPlayingRef.current) {
+          if (
+            activeEngineRef.current !== 'local' ||
+            intentionalPauseRef.current ||
+            handlingPlayFallbackRef.current === playRequestIdRef.current
+          ) {
+            return;
+          }
+          if (isPlayingRef.current || wantPlayingRef.current) {
             attemptRecoveryRef.current('error');
           } else {
             setIsBuffering(false);
@@ -2538,21 +4013,21 @@ export default function App() {
         onWaiting={() => {
           if (activeEngineRef.current !== 'remote') return;
           setIsBuffering(true);
-          if (stallTimerRef.current === null && isPlayingRef.current) {
+          if (stallTimerRef.current === null && (isPlayingRef.current || wantPlayingRef.current)) {
             stallTimerRef.current = window.setTimeout(() => {
               stallTimerRef.current = null;
-              if (activeEngineRef.current === 'remote' && isPlayingRef.current) {
+              if (activeEngineRef.current === 'remote' && (isPlayingRef.current || wantPlayingRef.current)) {
                 attemptRecoveryRef.current('stalled');
               }
             }, 8000);
           }
         }}
         onStalled={() => {
-          if (activeEngineRef.current !== 'remote' || !isPlayingRef.current) return;
+          if (activeEngineRef.current !== 'remote' || (!isPlayingRef.current && !wantPlayingRef.current)) return;
           if (stallTimerRef.current === null) {
             stallTimerRef.current = window.setTimeout(() => {
               stallTimerRef.current = null;
-              if (activeEngineRef.current === 'remote' && isPlayingRef.current) {
+              if (activeEngineRef.current === 'remote' && (isPlayingRef.current || wantPlayingRef.current)) {
                 attemptRecoveryRef.current('stalled');
               }
             }, 7000);
@@ -2571,15 +4046,23 @@ export default function App() {
         }}
         onPause={(e) => {
           if (activeEngineRef.current !== 'remote') return;
-          if (!e.currentTarget.ended && !intentionalPauseRef.current && isPlayingRef.current) {
+          if (intentionalPauseRef.current || performance.now() < suppressPauseUntilRef.current) return;
+          if (!e.currentTarget.ended && (isPlayingRef.current || wantPlayingRef.current)) {
             setIsPlaying(false);
           }
         }}
         onError={() => {
-          if (activeEngineRef.current !== 'remote' || intentionalPauseRef.current) return;
-          if (isPlayingRef.current) {
+          if (
+            activeEngineRef.current !== 'remote' ||
+            intentionalPauseRef.current ||
+            handlingPlayFallbackRef.current === playRequestIdRef.current
+          ) {
+            return;
+          }
+          if (isPlayingRef.current || wantPlayingRef.current) {
             attemptRecoveryRef.current('error');
           } else {
+            wantPlayingRef.current = false;
             setIsBuffering(false);
             setIsPlaying(false);
             setPlaybackError('ไม่สามารถเชื่อมต่อสตรีมจากลิงก์นี้ได้');
@@ -2609,21 +4092,33 @@ export default function App() {
 
       {/* Main Workspace */}
       <div className="flex-1 min-h-0 flex">
-        {/* Desktop Sidebar */}
-        <aside className="hidden md:flex w-64 shrink-0 flex-col justify-between bg-surface border-r border-border/70 p-5 min-h-0 overflow-y-auto">
-          <div className="space-y-6">
-            {/* Brand */}
-            <div className="flex items-center justify-between px-1">
-              <div className="flex items-center gap-2.5">
-                <div className="w-8 h-8 rounded-full bg-foreground text-surface flex items-center justify-center shrink-0">
-                  <Disc className="w-4 h-4" />
+        {/* Desktop Collapsible Sidebar */}
+        {!sidebarCollapsed && (
+          <aside className="hidden md:flex w-64 shrink-0 flex-col justify-between bg-surface border-r border-border/70 p-5 min-h-0 overflow-y-auto">
+            <div className="space-y-6">
+              {/* Brand & Sidebar Collapse */}
+              <div className="flex items-center justify-between px-1 gap-2">
+                <div className="flex items-center gap-2.5 min-w-0">
+                  <div className="w-8 h-8 rounded-full bg-foreground text-surface flex items-center justify-center shrink-0">
+                    <Disc className="w-4 h-4" />
+                  </div>
+                  <span className="text-base font-semibold tracking-tight truncate">Aura Audio</span>
                 </div>
-                <span className="text-base font-semibold tracking-tight">Aura Audio</span>
+                <div className="flex items-center gap-1.5 shrink-0">
+                  {isAdmin && (
+                    <span className="text-[11px] font-medium text-primary">Admin</span>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => setSidebarCollapsed(true)}
+                    aria-label="ย่อปิดแถบด้านข้าง"
+                    title="ย่อปิดแถบด้านข้าง (Ctrl+B)"
+                    className="w-8 h-8 rounded-control flex items-center justify-center text-muted hover:text-foreground hover:bg-foreground/5 transition-colors cursor-pointer"
+                  >
+                    <PanelLeftClose className="w-4 h-4" />
+                  </button>
+                </div>
               </div>
-              {isAdmin && (
-                <span className="text-[11px] font-medium text-primary">Admin</span>
-              )}
-            </div>
 
             {/* Library Navigation */}
             <nav aria-label="หมวดหมู่คลังเพลง" className="space-y-1">
@@ -2636,6 +4131,12 @@ export default function App() {
                     icon: Radio,
                     count:
                       serverStreams.length + (prefs.includeHddInStream ? localTracks.length : 0),
+                  },
+                  {
+                    id: 'lan',
+                    label: 'วง LAN (Local)',
+                    icon: Network,
+                    count: lanTracks.length,
                   },
                   {
                     id: 'local',
@@ -2792,6 +4293,25 @@ export default function App() {
               </Button>
               <Button
                 tone="ghost"
+                onClick={() => setLanModalOpen(true)}
+                className="w-full justify-start text-xs text-muted hover:text-foreground"
+              >
+                <Network
+                  className={`w-4 h-4 shrink-0 ${
+                    isSharingLan || connectedLanHostIds.length > 0
+                      ? 'text-emerald-600 dark:text-emerald-400'
+                      : 'text-primary'
+                  }`}
+                />
+                <span>ฟังผ่าน Local Network</span>
+              </Button>
+              <PWAInstallButton
+                variant="sidebar"
+                onInstalled={() => showStatus('ติดตั้งแอพ Aura Audio เรียบร้อยแล้ว')}
+                onStatusMessage={(msg) => showStatus(msg)}
+              />
+              <Button
+                tone="ghost"
                 onClick={() => setAndroidModalOpen(true)}
                 className="w-full justify-start text-xs text-muted hover:text-foreground"
               >
@@ -2829,16 +4349,42 @@ export default function App() {
             </button>
           </div>
         </aside>
+        )}
 
         {/* Main Content Pane */}
         <main className="flex-1 min-w-0 min-h-0 flex flex-col">
           {/* Top Header */}
           <header className="h-16 px-4 md:px-7 border-b border-border/70 bg-surface flex items-center justify-between gap-3 shrink-0">
-            <div className="flex items-center gap-2 md:hidden shrink-0">
-              <div className="w-7 h-7 rounded-full bg-foreground text-surface flex items-center justify-center">
-                <Disc className="w-3.5 h-3.5" />
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                type="button"
+                onClick={() => setSidebarCollapsed((prev) => !prev)}
+                aria-label={sidebarCollapsed ? 'เปิดแถบด้านข้าง' : 'ย่อปิดแถบด้านข้าง'}
+                title={sidebarCollapsed ? 'เปิดแถบด้านข้าง (Ctrl+B)' : 'ย่อปิดแถบด้านข้าง (Ctrl+B)'}
+                className="hidden md:inline-flex w-10 h-10 rounded-control border border-border items-center justify-center text-foreground hover:bg-foreground/5 transition-colors cursor-pointer"
+              >
+                {sidebarCollapsed ? (
+                  <PanelLeftOpen className="w-4 h-4" />
+                ) : (
+                  <PanelLeftClose className="w-4 h-4" />
+                )}
+              </button>
+
+              {sidebarCollapsed && (
+                <div className="hidden md:flex items-center gap-2 pr-1">
+                  <div className="w-7 h-7 rounded-full bg-foreground text-surface flex items-center justify-center">
+                    <Disc className="w-3.5 h-3.5" />
+                  </div>
+                  <span className="text-sm font-semibold tracking-tight">Aura Audio</span>
+                </div>
+              )}
+
+              <div className="flex items-center gap-2 md:hidden shrink-0">
+                <div className="w-7 h-7 rounded-full bg-foreground text-surface flex items-center justify-center">
+                  <Disc className="w-3.5 h-3.5" />
+                </div>
+                <span className="text-sm font-semibold">Aura</span>
               </div>
-              <span className="text-sm font-semibold">Aura</span>
             </div>
 
             <div className="flex-1 min-w-0 max-w-md relative">
@@ -2846,7 +4392,12 @@ export default function App() {
               <input
                 type="search"
                 value={searchQuery}
-                onChange={(e) => setSearchQuery(e.target.value)}
+                onChange={(e) => {
+                  setSearchQuery(e.target.value);
+                  if (albumShowcaseOpen && e.target.value.trim()) {
+                    setAlbumShowcaseOpen(false);
+                  }
+                }}
                 aria-label="ค้นหาเพลง ศิลปิน แนวเพลง โฟลเดอร์ หรือนามสกุลไฟล์"
                 placeholder="ค้นหาเพลง, ศิลปิน, แนวเพลง, โฟลเดอร์, FLAC..."
                 className="w-full min-h-10 pl-9 pr-3 text-sm rounded-control bg-background text-foreground border border-border/70 placeholder:text-muted focus-visible:outline-2 focus-visible:outline-primary"
@@ -2884,6 +4435,26 @@ export default function App() {
                 </Button>
               )}
 
+              <PWAInstallButton
+                variant="header"
+                onInstalled={() => showStatus('ติดตั้งแอพ Aura Audio เรียบร้อยแล้ว')}
+                onStatusMessage={(msg) => showStatus(msg)}
+              />
+
+              <button
+                type="button"
+                onClick={() => setLanModalOpen(true)}
+                aria-label="ฟังผ่าน Local Network (LAN / Wi-Fi)"
+                title="ฟังผ่าน Local Network (LAN / Wi-Fi)"
+                className={`w-10 h-10 rounded-control border flex items-center justify-center transition-colors cursor-pointer ${
+                  isSharingLan || connectedLanHostIds.length > 0
+                    ? 'border-primary text-primary bg-primary/10'
+                    : 'border-border text-foreground hover:bg-foreground/5'
+                }`}
+              >
+                <Network className="w-4 h-4" />
+              </button>
+
               <button
                 type="button"
                 onClick={() => setAndroidModalOpen(true)}
@@ -2892,6 +4463,27 @@ export default function App() {
                 className="w-10 h-10 rounded-control border border-border flex items-center justify-center text-foreground hover:bg-foreground/5 cursor-pointer"
               >
                 <Smartphone className="w-4 h-4" />
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setAlbumShowcaseOpen((prev) => !prev)}
+                aria-label={albumShowcaseOpen ? 'ปิดมุมมองหน้าปกเต็มหน้า' : 'แสดงหน้าปกอัลบั้มเต็มหน้า'}
+                title={albumShowcaseOpen ? 'กลับหน้ารายการเพลง (Esc)' : 'โชว์หน้าปกอัลบั้มใหญ่เต็มหน้า'}
+                className={`min-h-10 px-2.5 lg:px-3 rounded-control border flex items-center justify-center gap-1.5 text-xs font-medium transition-colors cursor-pointer ${
+                  albumShowcaseOpen
+                    ? 'border-primary text-primary bg-primary/10'
+                    : 'border-border text-foreground hover:bg-foreground/5'
+                }`}
+              >
+                {albumShowcaseOpen ? (
+                  <Minimize2 className="w-4 h-4 shrink-0" />
+                ) : (
+                  <Maximize2 className="w-4 h-4 shrink-0" />
+                )}
+                <span className="hidden lg:inline whitespace-nowrap">
+                  {albumShowcaseOpen ? 'กลับรายการเพลง' : 'หน้าปกเต็มหน้า'}
+                </span>
               </button>
 
               <button
@@ -2921,6 +4513,7 @@ export default function App() {
               [
                 { id: 'all', label: 'ทั้งหมด' },
                 { id: 'stream', label: 'สตรีมออนไลน์' },
+                { id: 'lan', label: 'วง LAN' },
                 { id: 'local', label: 'ไฟล์ในเครื่อง' },
                 { id: 'favorites', label: 'ถูกใจ' },
                 { id: 'recent', label: 'ฟังล่าสุด' },
@@ -2978,7 +4571,36 @@ export default function App() {
             </button>
           </div>
 
-          {/* Scrollable Library Content + Dropzone */}
+          {/* Full-Page Album Cover Showcase OR Library Content */}
+          {albumShowcaseOpen ? (
+            <AlbumShowcaseStage
+              track={showcaseTrack}
+              hasActiveTrack={Boolean(resolvedCurrentTrack)}
+              isPlaying={isPlaying}
+              isBuffering={isBuffering}
+              isFavorite={isShowcaseFav}
+              currentTime={currentTime}
+              duration={duration}
+              sidebarCollapsed={sidebarCollapsed}
+              analyser={analyserRef.current}
+              isSynthOrCors={
+                activeEngineRef.current === 'local' && isSameOriginTrack(resolvedCurrentTrack)
+              }
+              onToggleSidebar={() => setSidebarCollapsed((prev) => !prev)}
+              onClose={() => setAlbumShowcaseOpen(false)}
+              onTogglePlay={() => {
+                if (resolvedCurrentTrack) {
+                  togglePlayPause();
+                } else if (showcaseTrack) {
+                  playTrack(showcaseTrack);
+                }
+              }}
+              onPrev={playPrev}
+              onNext={playNext}
+              onToggleFavorite={handleToggleFavorite}
+            />
+          ) : (
+          /* Scrollable Library Content + Dropzone */
           <div
             className="flex-1 min-h-0 overflow-y-auto px-4 py-5 md:px-8 md:py-6 relative"
             onDragEnter={(e) => {
@@ -3028,6 +4650,38 @@ export default function App() {
                 </span>
               </div>
             )}
+
+            {/* One-Click Saved HDD Folder Reconnect Banner after Refresh */}
+            {!hddSyncProgress &&
+              savedHddHandles.length > 0 &&
+              localTracks.some((t) => !t.url) && (
+                <div className="mb-4 px-4 py-2.5 rounded-control border border-primary/40 bg-surface text-xs sm:text-sm flex flex-wrap items-center justify-between gap-3">
+                  <span className="flex items-center gap-2 min-w-0">
+                    <FolderOpen className="w-4 h-4 text-primary shrink-0" />
+                    <span className="truncate">
+                      พบโฟลเดอร์ HDD ที่ซิงค์ไว้ก่อนหน้า ({savedHddHandles.map((h) => h.name).join(', ')}) — กดเพื่อเชื่อมต่อไฟล์เสียงต่อทันที
+                    </span>
+                  </span>
+                  <Button
+                    tone="primary"
+                    onClick={() => {
+                      void (async () => {
+                        for (const rec of savedHddHandles) {
+                          try {
+                            await handleReconnectHddHandle(rec);
+                          } catch {
+                            // continue remaining handles
+                          }
+                        }
+                      })();
+                    }}
+                    className="min-h-8 px-3 text-xs shrink-0"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>เชื่อมต่อโฟลเดอร์ HDD ต่อทันที</span>
+                  </Button>
+                </div>
+              )}
 
             {/* Status Feedback Line */}
             {(statusMessage || playbackError) && (
@@ -3485,12 +5139,23 @@ export default function App() {
             {/* Active Studio Visualizer Strip */}
             <Surface className="border border-border/75 p-4 mb-6 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
               <div className="flex items-center gap-3.5 min-w-0">
-                <TrackCover
-                  src={currentTrack?.coverDataUrl}
-                  seed={currentTrack?.coverSeed ?? 1}
-                  title={currentTrack?.title || 'Aura Audio'}
-                  sizeClass="w-12 h-12"
-                />
+                <button
+                  type="button"
+                  onClick={() => setAlbumShowcaseOpen(true)}
+                  aria-label="ขยายดูหน้าปกอัลบั้มใหญ่เต็มหน้า"
+                  title="คลิกเพื่อโชว์หน้าปกอัลบั้มใหญ่เต็มหน้า"
+                  className="relative group shrink-0 rounded-lg cursor-pointer focus-visible:outline-2 focus-visible:outline-primary"
+                >
+                  <TrackCover
+                    src={resolvedCurrentTrack?.coverDataUrl}
+                    seed={resolvedCurrentTrack?.coverSeed ?? 1}
+                    title={resolvedCurrentTrack?.title || 'Aura Audio'}
+                    sizeClass="w-14 h-14"
+                  />
+                  <span className="absolute inset-0 rounded-lg bg-black/35 opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-center text-white">
+                    <Maximize2 className="w-4 h-4" />
+                  </span>
+                </button>
                 <div className="min-w-0">
                   <p className="text-xs text-muted truncate">
                     {isBuffering
@@ -3510,12 +5175,24 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="w-full sm:w-56 shrink-0">
-                <VisualizerCanvas
-                  analyser={analyserRef.current}
-                  isPlaying={isPlaying}
-                  isSynthOrCors={activeEngineRef.current === 'local' && isSameOriginTrack(currentTrack)}
-                />
+              <div className="flex items-center gap-3 w-full sm:w-auto shrink-0">
+                <div className="flex-1 sm:w-52">
+                  <VisualizerCanvas
+                    analyser={analyserRef.current}
+                    isPlaying={isPlaying}
+                    isSynthOrCors={activeEngineRef.current === 'local' && isSameOriginTrack(currentTrack)}
+                  />
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setAlbumShowcaseOpen(true)}
+                  aria-label="โชว์หน้าปกอัลบั้มเต็มหน้า"
+                  title="โชว์หน้าปกอัลบั้มใหญ่เต็มหน้า"
+                  className="h-10 px-3 rounded-control border border-border/80 bg-background hover:bg-foreground/5 text-xs font-medium text-foreground inline-flex items-center gap-1.5 shrink-0 cursor-pointer"
+                >
+                  <Maximize2 className="w-3.5 h-3.5 text-primary" />
+                  <span className="hidden md:inline">ปกใหญ่เต็มหน้า</span>
+                </button>
               </div>
             </Surface>
 
@@ -3680,13 +5357,17 @@ export default function App() {
                                 <span className="inline-flex items-center gap-1.5 flex-wrap">
                                   <span
                                     className={`w-1.5 h-1.5 rounded-full shrink-0 ${
-                                      track.source === 'local' || track.hddPath
+                                      track.source === 'lan'
+                                        ? 'bg-sky-600 dark:bg-sky-400'
+                                        : track.source === 'local' || track.hddPath
                                         ? 'bg-emerald-600 dark:bg-emerald-400'
                                         : 'bg-primary'
                                     }`}
                                   />
                                   <span className="font-medium text-foreground">
-                                    {track.hddPath
+                                    {track.source === 'lan'
+                                      ? `LAN · ${track.lanHostDeviceName || 'P2P'}`
+                                      : track.hddPath
                                       ? 'HDD Shared'
                                       : isShared
                                       ? 'Shared Stream'
@@ -3895,20 +5576,53 @@ export default function App() {
             ) : (
               <Surface className="border border-border/75 py-14 px-6 text-center">
                 <div className="w-11 h-11 rounded-full bg-background border border-border/70 flex items-center justify-center mx-auto mb-3 text-muted">
-                  <Music2 className="w-5 h-5" />
+                  {activeTab === 'lan' ? (
+                    <Network className="w-5 h-5" />
+                  ) : (
+                    <Music2 className="w-5 h-5" />
+                  )}
                 </div>
                 <p className="text-base font-medium">
-                  {activeTab === 'stream' || activeTab === 'admin'
+                  {activeTab === 'lan'
+                    ? 'ยังไม่ได้เชื่อมต่อเพลงจากเครื่องอื่นในวง Local Network'
+                    : activeTab === 'stream' || activeTab === 'admin'
                     ? 'ยังไม่มีเพลงในคลังสตรีมออนไลน์ส่วนกลาง'
                     : 'ไม่พบเพลงในหมวดหมู่นี้'}
                 </p>
                 <p className="text-sm text-muted mt-1 mb-5">
-                  {isAdmin
+                  {activeTab === 'lan'
+                    ? 'เปิดหน้าต่าง Local Network เพื่อเชื่อมต่อเครื่องอื่นใน Wi-Fi เดียวกัน หรือเปิดแชร์เพลงจากเครื่องนี้'
+                    : isAdmin
                     ? 'เลือกโฟลเดอร์หรือไฟล์บน HDD เพื่อสตรีมตรงให้ทุกเครื่องทันที โดยไม่อัปโหลดไฟล์ขึ้นระบบ'
                     : 'คุณสามารถเลือกไฟล์เพลงจาก HDD บนอุปกรณ์นี้มาฟังโดยตรง (ไม่อัปโหลด) หรือเข้าสู่ระบบ Admin'}
                 </p>
                 <div className="flex flex-wrap items-center justify-center gap-2">
-                  {isAdmin ? (
+                  {activeTab === 'lan' ? (
+                    <>
+                      <Button tone="primary" onClick={() => setLanModalOpen(true)}>
+                        <Network className="w-4 h-4" />
+                        <span>เปิดหน้าต่าง Local Network (Wi-Fi / LAN)</span>
+                      </Button>
+                      {lanHosts
+                        .filter((h) => h.deviceId !== deviceIdentity.deviceId)
+                        .slice(0, 3)
+                        .map((host) => (
+                          <Button
+                            key={host.deviceId}
+                            tone="quiet"
+                            disabled={connectingLanHostId === host.deviceId}
+                            onClick={() => void handleConnectLanHost(host)}
+                          >
+                            <Wifi className="w-4 h-4 text-primary" />
+                            <span>
+                              {connectingLanHostId === host.deviceId
+                                ? 'กำลังเชื่อม...'
+                                : `ฟังจาก ${host.deviceName} (${host.trackCount})`}
+                            </span>
+                          </Button>
+                        ))}
+                    </>
+                  ) : isAdmin ? (
                     <>
                       <Button tone="primary" onClick={() => setHddModalOpen(true)}>
                         <HardDrive className="w-4 h-4" />
@@ -3935,6 +5649,7 @@ export default function App() {
               </Surface>
             )}
           </div>
+          )}
         </main>
       </div>
 
@@ -3960,11 +5675,17 @@ export default function App() {
         <div className="flex flex-col sm:flex-row items-center justify-between gap-3">
           {/* Left: Current Track Info */}
           <div className="flex items-center gap-3 w-full sm:w-1/3 min-w-0">
-            <div className="relative shrink-0">
+            <button
+              type="button"
+              onClick={() => setAlbumShowcaseOpen((prev) => !prev)}
+              aria-label={albumShowcaseOpen ? 'ปิดหน้าปกอัลบั้มเต็มหน้า' : 'ดูหน้าปกอัลบั้มใหญ่เต็มหน้า'}
+              title={albumShowcaseOpen ? 'คลิกเพื่อกลับรายการเพลง' : 'คลิกเพื่อโชว์หน้าปกอัลบั้มใหญ่เต็มหน้า'}
+              className="relative shrink-0 rounded-full cursor-pointer group focus-visible:outline-2 focus-visible:outline-primary"
+            >
               <TrackCover
-                src={currentTrack?.coverDataUrl}
-                seed={currentTrack?.coverSeed ?? 1}
-                title={currentTrack?.title || 'Aura'}
+                src={resolvedCurrentTrack?.coverDataUrl}
+                seed={resolvedCurrentTrack?.coverSeed ?? 1}
+                title={resolvedCurrentTrack?.title || 'Aura'}
                 sizeClass="w-11 h-11"
                 roundedClass="rounded-full"
                 spinning={isPlaying}
@@ -3973,7 +5694,7 @@ export default function App() {
                 aria-hidden="true"
                 className="w-2.5 h-2.5 rounded-full bg-surface border border-border absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2"
               />
-            </div>
+            </button>
 
             <div className="min-w-0 flex-1">
               <p className="text-sm font-semibold truncate" title={currentTrack?.title}>
@@ -4361,6 +6082,33 @@ export default function App() {
           );
         }}
       />
+
+      <LanNetworkModal
+        open={lanModalOpen}
+        onClose={() => setLanModalOpen(false)}
+        myDevice={deviceIdentity}
+        isSharingLan={isSharingLan}
+        sharingBusy={sharingLanBusy}
+        localTrackCount={localTracks.length}
+        activePeerCount={lanPeerCount}
+        lanHosts={lanHosts}
+        connectedHostIds={connectedLanHostIds}
+        connectingHostId={connectingLanHostId}
+        onToggleShareLan={handleToggleShareLan}
+        onConnectLanHost={handleConnectLanHost}
+        onDisconnectLanHost={handleDisconnectLanHost}
+        onRefreshLanHosts={handleRefreshLanHosts}
+        onServerUrlSaved={(resolvedUrl) => {
+          setServerConfigVersion((v) => v + 1);
+          showStatus(
+            resolvedUrl
+              ? `สลับเซิร์ฟเวอร์เป็น ${resolvedUrl} แล้ว`
+              : 'สลับกลับไปใช้เซิร์ฟเวอร์เริ่มต้นแล้ว'
+          );
+        }}
+      />
+      <PWAUpdateBanner />
+      <OfflineIndicator />
     </div>
   );
 }

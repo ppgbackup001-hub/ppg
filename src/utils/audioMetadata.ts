@@ -1,4 +1,4 @@
-import { parseBlob } from 'music-metadata';
+import { parseBlob, selectCover } from 'music-metadata';
 import type { Track } from '../types/music';
 
 export const SUPPORTED_AUDIO_EXTENSIONS = [
@@ -90,6 +90,113 @@ function uint8ToDataUrl(data: Uint8Array, mimeType: string): string {
   return `data:${mimeType};base64,${btoa(binary)}`;
 }
 
+const COVER_IMAGE_BASES = ['cover', 'folder', 'front', 'album', 'albumart'];
+const COVER_IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'webp']);
+
+export function getCoverImagePriority(filename: string): number {
+  const base = filename.replace(/\.[^/.]+$/, '').trim().toLowerCase();
+  const ext = getFileExtension(filename);
+  if (!COVER_IMAGE_EXTS.has(ext)) return -1;
+  return COVER_IMAGE_BASES.indexOf(base);
+}
+
+export function isCoverImageFilename(filename: string): boolean {
+  return getCoverImagePriority(filename) !== -1;
+}
+
+export async function resizeImageBlobToDataUrl(
+  blob: Blob,
+  maxDim = 512
+): Promise<string | undefined> {
+  if (typeof document === 'undefined' || typeof Image === 'undefined') {
+    if (blob.size <= 400 * 1024) {
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      return uint8ToDataUrl(buf, blob.type || 'image/jpeg');
+    }
+    return undefined;
+  }
+
+  const objUrl = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+      const el = new Image();
+      const timer = window.setTimeout(() => reject(new Error('image-timeout')), 4000);
+      el.onload = () => {
+        window.clearTimeout(timer);
+        resolve(el);
+      };
+      el.onerror = () => {
+        window.clearTimeout(timer);
+        reject(new Error('image-error'));
+      };
+      el.src = objUrl;
+    });
+
+    const w = img.naturalWidth || img.width;
+    const h = img.naturalHeight || img.height;
+    if (!w || !h) return undefined;
+
+    if (w <= maxDim && h <= maxDim && blob.size <= 120 * 1024) {
+      const buf = new Uint8Array(await blob.arrayBuffer());
+      return uint8ToDataUrl(buf, blob.type || 'image/jpeg');
+    }
+
+    const scale = Math.min(1, maxDim / Math.max(w, h));
+    const targetW = Math.max(1, Math.round(w * scale));
+    const targetH = Math.max(1, Math.round(h * scale));
+
+    const canvas = document.createElement('canvas');
+    canvas.width = targetW;
+    canvas.height = targetH;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return undefined;
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(img, 0, 0, targetW, targetH);
+
+    const out = canvas.toDataURL('image/jpeg', 0.84);
+    return out && out.startsWith('data:image/') ? out : undefined;
+  } catch {
+    if (blob.size <= 400 * 1024) {
+      try {
+        const buf = new Uint8Array(await blob.arrayBuffer());
+        return uint8ToDataUrl(buf, blob.type || 'image/jpeg');
+      } catch {
+        return undefined;
+      }
+    }
+    return undefined;
+  } finally {
+    URL.revokeObjectURL(objUrl);
+  }
+}
+
+export async function extractCoverFromImageFile(
+  file: File,
+  maxDim = 512
+): Promise<string | undefined> {
+  return resizeImageBlobToDataUrl(file, maxDim);
+}
+
+export async function extractCoverFromAudioBlob(
+  blob: Blob,
+  maxDim = 512
+): Promise<string | undefined> {
+  try {
+    const metadata = await parseBlob(blob, {
+      duration: false,
+      skipCovers: false,
+    });
+    const pic = selectCover(metadata.common.picture) || metadata.common.picture?.[0];
+    if (!pic || pic.data.byteLength === 0) return undefined;
+    const imgBytes = Uint8Array.from(pic.data);
+    const imgBlob = new Blob([imgBytes], { type: pic.format || 'image/jpeg' });
+    return await resizeImageBlobToDataUrl(imgBlob, maxDim);
+  } catch {
+    return undefined;
+  }
+}
+
 async function readNativeDuration(url: string, timeoutMs = 1200): Promise<number | null> {
   return new Promise((resolve) => {
     const audio = new Audio();
@@ -119,6 +226,7 @@ export interface ExtractLocalTrackOptions {
   syncedFolder?: string;
   skipNativeDurationProbe?: boolean;
   fastMode?: boolean;
+  fallbackCoverDataUrl?: string;
 }
 
 export function normalizeGenre(raw?: string[] | string): string | undefined {
@@ -186,11 +294,15 @@ export async function extractLocalTrack(
     genre = normalizeGenre(metadata.common.genre);
 
     if (!fastMode && metadata.common.picture && metadata.common.picture.length > 0) {
-      const pic = metadata.common.picture[0];
-      if (pic.data.byteLength <= 250 * 1024) {
-        const mime = pic.format || 'image/jpeg';
-        coverDataUrl = uint8ToDataUrl(pic.data, mime);
+      const pic = selectCover(metadata.common.picture) || metadata.common.picture[0];
+      if (pic && pic.data.byteLength > 0) {
+        const imgBytes = Uint8Array.from(pic.data);
+        const imgBlob = new Blob([imgBytes], { type: pic.format || 'image/jpeg' });
+        coverDataUrl = await resizeImageBlobToDataUrl(imgBlob, 512);
       }
+    }
+    if (!coverDataUrl && options?.fallbackCoverDataUrl) {
+      coverDataUrl = options.fallbackCoverDataUrl;
     }
 
     if (metadata.format.duration && isFinite(metadata.format.duration)) {

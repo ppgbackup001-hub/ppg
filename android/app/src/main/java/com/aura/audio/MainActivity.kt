@@ -89,10 +89,10 @@ class MainActivity : AppCompatActivity() {
 
         webView.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(
-                view: WebView,
-                request: WebResourceRequest
+                view: WebView?,
+                request: WebResourceRequest?
             ): WebResourceResponse? {
-                val uri = request.url
+                val uri = request?.url ?: return super.shouldInterceptRequest(view, request)
                 if (uri.host == "appassets.androidplatform.net") {
                     val response = assetLoader.shouldInterceptRequest(uri)
                     if (response != null) {

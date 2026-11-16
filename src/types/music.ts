@@ -1,4 +1,4 @@
-export type TrackSource = 'local' | 'stream' | 'synth';
+export type TrackSource = 'local' | 'stream' | 'synth' | 'lan';
 
 export type SynthPreset = 'rain-rhodes' | 'tape-loop';
 
@@ -22,6 +22,9 @@ export interface Track {
   streamUrl?: string;
   hddPath?: string;
   publishedStreamId?: string;
+  lanHostDeviceId?: string;
+  lanHostDeviceName?: string;
+  lanOriginalTrackId?: string;
   coverDataUrl?: string;
   coverSeed: number;
   addedAt: number;
@@ -111,6 +114,7 @@ export interface HddBrowseResult {
 export type LibraryTab =
   | 'all'
   | 'stream'
+  | 'lan'
   | 'local'
   | 'favorites'
   | 'recent'
@@ -170,6 +174,60 @@ export interface CastCommandPayload {
   action: CastAction;
   track?: Track;
   positionSec?: number;
+  sentAt: number;
+}
+
+export interface NetworkInterfaceUrl {
+  name: string;
+  ip: string;
+  url: string;
+}
+
+export interface NetworkInfoResponse {
+  hostname: string;
+  port: number;
+  isCloudContainer: boolean;
+  lanUrls: NetworkInterfaceUrl[];
+  connectedDevices: number;
+  lanHostsCount: number;
+}
+
+export interface LanSharedTrackMeta {
+  id: string;
+  title: string;
+  artist: string;
+  album?: string;
+  genre?: string;
+  folderName?: string;
+  format: string;
+  formatDetail: string;
+  isLossless?: boolean;
+  durationSec: number | null;
+  durationLabel: string;
+  sizeBytes?: number;
+  sampleRate?: number;
+  bitrate?: number;
+  coverDataUrl?: string;
+  hasCover?: boolean;
+  coverSeed: number;
+  addedAt: number;
+}
+
+export interface LanHostInfo {
+  deviceId: string;
+  deviceName: string;
+  deviceType: CastDeviceType;
+  tracks: LanSharedTrackMeta[];
+  trackCount: number;
+  updatedAt: number;
+}
+
+export interface LanSignalPayload {
+  fromDeviceId: string;
+  fromDeviceName: string;
+  targetDeviceId: string;
+  signalType: 'offer' | 'answer' | 'ice' | 'reject';
+  data: unknown;
   sentAt: number;
 }
 

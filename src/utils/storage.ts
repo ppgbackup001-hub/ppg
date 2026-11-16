@@ -13,10 +13,12 @@ const THEME_KEY = 'aura_theme_v1';
 const PREFS_PREFIX = 'aura_prefs_v1:';
 const STREAMS_PREFIX = 'aura_custom_streams_v1:';
 const SYNCED_FOLDERS_PREFIX = 'aura_synced_hdd_folders_v1:';
+const SERVER_LIBRARY_CACHE_PREFIX = 'aura_cached_server_library_v1:';
 
 const IDB_NAME = 'aura_audio_db_v2';
 const IDB_STORE = 'local_tracks';
 const IDB_HANDLES_STORE = 'hdd_handles';
+const IDB_STREAM_CACHE_STORE = 'cached_stream_media';
 
 export const DEFAULT_EQ_BANDS: EqBands = [0, 0, 0, 0, 0];
 
@@ -176,7 +178,8 @@ export function saveCustomStreams(ownerId: string, streams: Track[]): boolean {
 interface StoredLocalRecord {
   id: string;
   ownerId: string;
-  blob: Blob;
+  blob: Blob | null;
+  fileHandle?: FileSystemFileHandle;
   track: Omit<Track, 'url'>;
 }
 
@@ -194,7 +197,7 @@ function openAudioDb(): Promise<IDBDatabase> {
       reject(new Error('IndexedDB unavailable'));
       return;
     }
-    const req = window.indexedDB.open(IDB_NAME, 2);
+    const req = window.indexedDB.open(IDB_NAME, 4);
     req.onupgradeneeded = () => {
       const db = req.result;
       if (!db.objectStoreNames.contains(IDB_STORE)) {
@@ -204,6 +207,10 @@ function openAudioDb(): Promise<IDBDatabase> {
       if (!db.objectStoreNames.contains(IDB_HANDLES_STORE)) {
         const handleStore = db.createObjectStore(IDB_HANDLES_STORE, { keyPath: 'id' });
         handleStore.createIndex('ownerId', 'ownerId', { unique: false });
+      }
+      if (!db.objectStoreNames.contains(IDB_STREAM_CACHE_STORE)) {
+        const streamStore = db.createObjectStore(IDB_STREAM_CACHE_STORE, { keyPath: 'id' });
+        streamStore.createIndex('serverScope', 'serverScope', { unique: false });
       }
     };
     req.onsuccess = () => resolve(req.result);
@@ -242,20 +249,29 @@ export function removeSyncedFolderSummary(ownerId: string, id: string): SyncedHd
   return next;
 }
 
-const MAX_IDB_BLOB_BYTES = 80 * 1024 * 1024;
-const MAX_IDB_BATCH_TOTAL_BYTES = 600 * 1024 * 1024;
+const MAX_IDB_BLOB_BYTES = 150 * 1024 * 1024;
+const MAX_IDB_BATCH_TOTAL_BYTES = 2048 * 1024 * 1024;
 
-export async function saveLocalTrackToDb(track: Track, blob: Blob): Promise<void> {
-  if (blob.size > MAX_IDB_BLOB_BYTES) {
-    return;
-  }
+export interface LocalDbSaveItem {
+  track: Track;
+  blob: Blob;
+  fileHandle?: FileSystemFileHandle;
+}
+
+export async function saveLocalTrackToDb(
+  track: Track,
+  blob: Blob,
+  fileHandle?: FileSystemFileHandle
+): Promise<void> {
   try {
     const db = await openAudioDb();
     const { url: _unusedUrl, ...rest } = track;
+    const storeBlob = blob.size <= MAX_IDB_BLOB_BYTES ? blob : null;
     const record: StoredLocalRecord = {
       id: track.id,
       ownerId: track.ownerId,
-      blob,
+      blob: storeBlob,
+      ...(fileHandle ? { fileHandle } : {}),
       track: rest,
     };
     await new Promise<void>((resolve, reject) => {
@@ -270,32 +286,79 @@ export async function saveLocalTrackToDb(track: Track, blob: Blob): Promise<void
   }
 }
 
-export async function saveLocalTracksBatchToDb(
-  items: Array<{ track: Track; blob: Blob }>
-): Promise<void> {
+export async function saveLocalTracksMetaFirstToDb(items: LocalDbSaveItem[]): Promise<void> {
   if (items.length === 0) return;
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openAudioDb();
+    const existingRecords = await new Promise<StoredLocalRecord[]>((resolve) => {
+      try {
+        const tx = db!.transaction(IDB_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STORE).getAll();
+        req.onsuccess = () => resolve((req.result as StoredLocalRecord[]) || []);
+        req.onerror = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    });
+    const existingMap = new Map(existingRecords.map((r) => [r.id, r]));
+
+    const CHUNK = 50;
+    for (let i = 0; i < items.length; i += CHUNK) {
+      const slice = items.slice(i, i + CHUNK);
+      await new Promise<void>((resolve, reject) => {
+        const tx = db!.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        for (const { track, fileHandle } of slice) {
+          const { url: _unusedUrl, ...rest } = track;
+          const prev = existingMap.get(track.id);
+          const record: StoredLocalRecord = {
+            id: track.id,
+            ownerId: track.ownerId,
+            blob: prev?.blob || null,
+            ...(fileHandle || prev?.fileHandle ? { fileHandle: fileHandle || prev?.fileHandle } : {}),
+            track: { ...rest, publishedStreamId: rest.publishedStreamId || prev?.track.publishedStreamId },
+          };
+          store.put(record);
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+  } catch {
+    // ignore metadata save failure
+  } finally {
+    db?.close();
+  }
+}
+
+export async function saveLocalTracksBatchToDb(items: LocalDbSaveItem[]): Promise<void> {
+  if (items.length === 0) return;
+  await saveLocalTracksMetaFirstToDb(items);
+
   let db: IDBDatabase | null = null;
   try {
     db = await openAudioDb();
     let totalSavedBytes = 0;
     const eligible = items.filter(({ blob }) => {
-      if (blob.size > MAX_IDB_BLOB_BYTES) return false;
+      if (blob.size <= 0 || blob.size > MAX_IDB_BLOB_BYTES) return false;
       if (totalSavedBytes + blob.size > MAX_IDB_BATCH_TOTAL_BYTES) return false;
       totalSavedBytes += blob.size;
       return true;
     });
     if (eligible.length === 0) return;
 
-    const putChunk = (slice: Array<{ track: Track; blob: Blob }>) =>
+    const putChunk = (slice: LocalDbSaveItem[]) =>
       new Promise<void>((resolve, reject) => {
         const tx = db!.transaction(IDB_STORE, 'readwrite');
         const store = tx.objectStore(IDB_STORE);
-        for (const { track, blob } of slice) {
+        for (const { track, blob, fileHandle } of slice) {
           const { url: _unusedUrl, ...rest } = track;
           const record: StoredLocalRecord = {
             id: track.id,
             ownerId: track.ownerId,
             blob,
+            ...(fileHandle ? { fileHandle } : {}),
             track: rest,
           };
           store.put(record);
@@ -304,25 +367,24 @@ export async function saveLocalTracksBatchToDb(
         tx.onerror = () => reject(tx.error);
       });
 
-    const CHUNK = 15;
+    const CHUNK = 5;
     for (let i = 0; i < eligible.length; i += CHUNK) {
       const slice = eligible.slice(i, i + CHUNK);
       try {
         await putChunk(slice);
       } catch {
-        // Fallback: save individually so one oversized/corrupt item never drops the rest
         for (const single of slice) {
           try {
             await putChunk([single]);
           } catch {
-            // Stop further writes if browser storage quota is full
+            // Browser storage quota reached for blobs; metadata & fileHandles remain safely stored
             return;
           }
         }
       }
     }
   } catch {
-    // Non-fatal: tracks play directly from HDD objectURL in current session
+    // Non-fatal: metadata & handles are already persisted
   } finally {
     db?.close();
   }
@@ -369,7 +431,7 @@ export async function loadLocalTracksFromDb(ownerId: string): Promise<Track[]> {
       .sort((a, b) => b.track.addedAt - a.track.addedAt)
       .map((rec) => ({
         ...rec.track,
-        url: URL.createObjectURL(rec.blob),
+        url: rec.blob ? URL.createObjectURL(rec.blob) : '',
       }));
   } catch {
     return [];
@@ -386,7 +448,28 @@ export async function getLocalBlobFromDb(trackId: string): Promise<Blob | null> 
       req.onerror = () => reject(req.error);
     });
     db.close();
-    return record?.blob || null;
+    if (record?.blob) return record.blob;
+    if (record?.fileHandle) {
+      try {
+        const handleWithPerm = record.fileHandle as FileSystemFileHandle & {
+          queryPermission?: (opts: { mode: 'read' }) => Promise<PermissionState>;
+          requestPermission?: (opts: { mode: 'read' }) => Promise<PermissionState>;
+        };
+        let state: PermissionState = 'granted';
+        if (handleWithPerm.queryPermission) {
+          state = await handleWithPerm.queryPermission({ mode: 'read' });
+        }
+        if (state !== 'granted' && handleWithPerm.requestPermission) {
+          state = await handleWithPerm.requestPermission({ mode: 'read' });
+        }
+        if (state === 'granted') {
+          return await record.fileHandle.getFile();
+        }
+      } catch {
+        // permission denied or handle stale
+      }
+    }
+    return null;
   } catch {
     return null;
   }
@@ -415,7 +498,7 @@ export async function clearLocalTracksFromDb(ownerId: string): Promise<void> {
       const tx = db.transaction(IDB_STORE, 'readwrite');
       const store = tx.objectStore(IDB_STORE);
       for (const t of tracks) {
-        URL.revokeObjectURL(t.url);
+        if (t.url.startsWith('blob:')) URL.revokeObjectURL(t.url);
         store.delete(t.id);
       }
       tx.oncomplete = () => resolve();
@@ -470,6 +553,89 @@ export async function loadHddHandlesFromDb(ownerId: string): Promise<StoredHddHa
   }
 }
 
+export async function adoptGuestLocalData(targetOwnerId: string): Promise<void> {
+  if (!targetOwnerId || targetOwnerId === 'guest') return;
+  try {
+    const db = await openAudioDb();
+
+    const guestTracks = await new Promise<StoredLocalRecord[]>((resolve) => {
+      try {
+        const tx = db.transaction(IDB_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STORE).index('ownerId').getAll('guest');
+        req.onsuccess = () => resolve((req.result as StoredLocalRecord[]) || []);
+        req.onerror = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    });
+
+    if (guestTracks.length > 0) {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(IDB_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_STORE);
+        for (const rec of guestTracks) {
+          store.put({
+            ...rec,
+            ownerId: targetOwnerId,
+            track: { ...rec.track, ownerId: targetOwnerId },
+          });
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    const guestHandles = await new Promise<StoredHddHandleRecord[]>((resolve) => {
+      try {
+        const tx = db.transaction(IDB_HANDLES_STORE, 'readonly');
+        const req = tx.objectStore(IDB_HANDLES_STORE).index('ownerId').getAll('guest');
+        req.onsuccess = () => resolve((req.result as StoredHddHandleRecord[]) || []);
+        req.onerror = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    });
+
+    if (guestHandles.length > 0) {
+      await new Promise<void>((resolve, reject) => {
+        const tx = db.transaction(IDB_HANDLES_STORE, 'readwrite');
+        const store = tx.objectStore(IDB_HANDLES_STORE);
+        for (const rec of guestHandles) {
+          store.delete(rec.id);
+          store.put({
+            ...rec,
+            id: `hdd-${targetOwnerId}-${rec.name}`,
+            ownerId: targetOwnerId,
+          });
+        }
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    }
+
+    db.close();
+  } catch {
+    // ignore IDB adoption error
+  }
+
+  try {
+    const guestFolders = loadSyncedFolderSummaries('guest');
+    if (guestFolders.length > 0) {
+      for (const f of guestFolders) {
+        saveSyncedFolderSummary(targetOwnerId, {
+          name: f.name,
+          trackCount: f.trackCount,
+          lastSyncedAt: f.lastSyncedAt,
+          mode: f.mode,
+        });
+      }
+      clearSyncedFolderSummaries('guest');
+    }
+  } catch {
+    // ignore summary migration failure
+  }
+}
+
 export async function deleteHddHandleFromDb(id: string): Promise<void> {
   try {
     const db = await openAudioDb();
@@ -512,4 +678,349 @@ export function clearSyncedFolderSummaries(ownerId: string): void {
     // ignore
   }
 }
+
+// --- Persistent Device Cache for Shared Server Library, Covers & Audio ---
+
+export interface CachedServerLibrary {
+  version: string;
+  tracks: Track[];
+  cachedAt: number;
+}
+
+interface StoredStreamMediaRecord {
+  id: string; // `${serverScope}::${trackId}`
+  serverScope: string;
+  trackId: string;
+  signature: string;
+  coverDataUrl?: string;
+  audioBlob?: Blob;
+  audioSize?: number;
+  lastAccessedAt: number;
+}
+
+const MAX_CACHED_STREAM_BLOB_BYTES = 120 * 1024 * 1024;
+const MAX_CACHED_STREAM_TOTAL_BYTES = 350 * 1024 * 1024;
+
+function streamMediaKey(serverScope: string, trackId: string): string {
+  return `${serverScope}::${trackId}`;
+}
+
+export function getStreamTrackSignature(track: Track): string {
+  const sourceRef = track.streamUrl || track.url || '';
+  return `${track.sizeBytes || 0}:${track.addedAt}:${track.format}:${sourceRef}`;
+}
+
+export function loadCachedServerLibrary(serverScope: string): CachedServerLibrary | null {
+  const saved = safeReadJson<CachedServerLibrary | null>(
+    `${SERVER_LIBRARY_CACHE_PREFIX}${serverScope}`,
+    null
+  );
+  if (!saved || !Array.isArray(saved.tracks) || typeof saved.version !== 'string') {
+    return null;
+  }
+  return saved;
+}
+
+export function saveCachedServerLibrary(
+  serverScope: string,
+  version: string,
+  tracks: Track[]
+): boolean {
+  const compactTracks = tracks.map((t) =>
+    t.coverDataUrl && t.coverDataUrl.startsWith('data:') ? { ...t, coverDataUrl: undefined } : t
+  );
+  const payload: CachedServerLibrary = {
+    version,
+    tracks: compactTracks,
+    cachedAt: Date.now(),
+  };
+  return safeWriteJson(`${SERVER_LIBRARY_CACHE_PREFIX}${serverScope}`, payload);
+}
+
+export function clearCachedServerLibrary(serverScope: string): void {
+  try {
+    localStorage.removeItem(`${SERVER_LIBRARY_CACHE_PREFIX}${serverScope}`);
+  } catch {
+    // ignore
+  }
+}
+
+export async function loadCachedStreamCovers(
+  serverScope: string
+): Promise<Map<string, { signature: string; coverDataUrl: string }>> {
+  const map = new Map<string, { signature: string; coverDataUrl: string }>();
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openAudioDb();
+    const records = await new Promise<StoredStreamMediaRecord[]>((resolve) => {
+      try {
+        const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readonly');
+        const idx = tx.objectStore(IDB_STREAM_CACHE_STORE).index('serverScope');
+        const req = idx.getAll(serverScope);
+        req.onsuccess = () => resolve((req.result as StoredStreamMediaRecord[]) || []);
+        req.onerror = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    });
+    for (const rec of records) {
+      if (rec.coverDataUrl) {
+        map.set(rec.trackId, {
+          signature: rec.signature,
+          coverDataUrl: rec.coverDataUrl,
+        });
+      }
+    }
+  } catch {
+    // ignore
+  } finally {
+    db?.close();
+  }
+  return map;
+}
+
+export async function saveCachedStreamCover(
+  track: Track,
+  serverScope: string,
+  coverDataUrl: string
+): Promise<void> {
+  if (!coverDataUrl) return;
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openAudioDb();
+    const key = streamMediaKey(serverScope, track.id);
+    const sig = getStreamTrackSignature(track);
+    const existing = await new Promise<StoredStreamMediaRecord | undefined>((resolve) => {
+      try {
+        const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STREAM_CACHE_STORE).get(key);
+        req.onsuccess = () => resolve(req.result as StoredStreamMediaRecord | undefined);
+        req.onerror = () => resolve(undefined);
+      } catch {
+        resolve(undefined);
+      }
+    });
+
+    const record: StoredStreamMediaRecord = {
+      id: key,
+      serverScope,
+      trackId: track.id,
+      signature: sig,
+      coverDataUrl,
+      ...(existing && existing.signature === sig && existing.audioBlob
+        ? { audioBlob: existing.audioBlob, audioSize: existing.audioSize }
+        : {}),
+      lastAccessedAt: Date.now(),
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readwrite');
+      tx.objectStore(IDB_STREAM_CACHE_STORE).put(record);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // non-fatal
+  } finally {
+    db?.close();
+  }
+}
+
+export async function getCachedStreamAudioBlob(
+  track: Track,
+  serverScope: string
+): Promise<Blob | null> {
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openAudioDb();
+    const key = streamMediaKey(serverScope, track.id);
+    const record = await new Promise<StoredStreamMediaRecord | undefined>((resolve) => {
+      try {
+        const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STREAM_CACHE_STORE).get(key);
+        req.onsuccess = () => resolve(req.result as StoredStreamMediaRecord | undefined);
+        req.onerror = () => resolve(undefined);
+      } catch {
+        resolve(undefined);
+      }
+    });
+    if (!record || !record.audioBlob) return null;
+    if (record.signature !== getStreamTrackSignature(track)) {
+      return null;
+    }
+    try {
+      const tx = db.transaction(IDB_STREAM_CACHE_STORE, 'readwrite');
+      tx.objectStore(IDB_STREAM_CACHE_STORE).put({
+        ...record,
+        lastAccessedAt: Date.now(),
+      });
+    } catch {
+      // ignore touch error
+    }
+    return record.audioBlob;
+  } catch {
+    return null;
+  } finally {
+    db?.close();
+  }
+}
+
+export async function saveCachedStreamAudioBlob(
+  track: Track,
+  serverScope: string,
+  blob: Blob
+): Promise<void> {
+  if (!blob || blob.size <= 0 || blob.size > MAX_CACHED_STREAM_BLOB_BYTES) return;
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openAudioDb();
+    const key = streamMediaKey(serverScope, track.id);
+    const sig = getStreamTrackSignature(track);
+
+    const allRecords = await new Promise<StoredStreamMediaRecord[]>((resolve) => {
+      try {
+        const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readonly');
+        const req = tx.objectStore(IDB_STREAM_CACHE_STORE).getAll();
+        req.onsuccess = () => resolve((req.result as StoredStreamMediaRecord[]) || []);
+        req.onerror = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    });
+
+    const existing = allRecords.find((r) => r.id === key);
+    let totalAudioBytes = allRecords.reduce(
+      (sum, r) => sum + (r.id === key ? 0 : r.audioSize || r.audioBlob?.size || 0),
+      0
+    );
+
+    const evictionCandidates = allRecords
+      .filter((r) => r.id !== key && r.audioBlob)
+      .sort((a, b) => a.lastAccessedAt - b.lastAccessedAt);
+
+    const toEvict: StoredStreamMediaRecord[] = [];
+    for (const candidate of evictionCandidates) {
+      if (totalAudioBytes + blob.size <= MAX_CACHED_STREAM_TOTAL_BYTES) break;
+      const sz = candidate.audioSize || candidate.audioBlob?.size || 0;
+      totalAudioBytes = Math.max(0, totalAudioBytes - sz);
+      toEvict.push(candidate);
+    }
+
+    const nextRecord: StoredStreamMediaRecord = {
+      id: key,
+      serverScope,
+      trackId: track.id,
+      signature: sig,
+      ...(existing?.coverDataUrl && existing.signature === sig
+        ? { coverDataUrl: existing.coverDataUrl }
+        : {}),
+      audioBlob: blob,
+      audioSize: blob.size,
+      lastAccessedAt: Date.now(),
+    };
+
+    await new Promise<void>((resolve, reject) => {
+      const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STREAM_CACHE_STORE);
+      for (const oldRec of toEvict) {
+        if (oldRec.coverDataUrl) {
+          store.put({
+            id: oldRec.id,
+            serverScope: oldRec.serverScope,
+            trackId: oldRec.trackId,
+            signature: oldRec.signature,
+            coverDataUrl: oldRec.coverDataUrl,
+            lastAccessedAt: oldRec.lastAccessedAt,
+          });
+        } else {
+          store.delete(oldRec.id);
+        }
+      }
+      store.put(nextRecord);
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // quota full or IDB error — non-fatal
+  } finally {
+    db?.close();
+  }
+}
+
+export async function pruneCachedStreamMedia(
+  serverScope: string,
+  activeTracks: Track[]
+): Promise<void> {
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openAudioDb();
+    const records = await new Promise<StoredStreamMediaRecord[]>((resolve) => {
+      try {
+        const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readonly');
+        const idx = tx.objectStore(IDB_STREAM_CACHE_STORE).index('serverScope');
+        const req = idx.getAll(serverScope);
+        req.onsuccess = () => resolve((req.result as StoredStreamMediaRecord[]) || []);
+        req.onerror = () => resolve([]);
+      } catch {
+        resolve([]);
+      }
+    });
+    if (records.length === 0) return;
+
+    const activeSigMap = new Map(activeTracks.map((t) => [t.id, getStreamTrackSignature(t)]));
+    const staleKeys: string[] = [];
+    for (const rec of records) {
+      const currentSig = activeSigMap.get(rec.trackId);
+      if (!currentSig || currentSig !== rec.signature) {
+        staleKeys.push(rec.id);
+      }
+    }
+    if (staleKeys.length === 0) return;
+
+    await new Promise<void>((resolve, reject) => {
+      const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STREAM_CACHE_STORE);
+      for (const k of staleKeys) {
+        store.delete(k);
+      }
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // ignore
+  } finally {
+    db?.close();
+  }
+}
+
+export async function clearCachedStreamMedia(serverScope?: string): Promise<void> {
+  let db: IDBDatabase | null = null;
+  try {
+    db = await openAudioDb();
+    await new Promise<void>((resolve, reject) => {
+      const tx = db!.transaction(IDB_STREAM_CACHE_STORE, 'readwrite');
+      const store = tx.objectStore(IDB_STREAM_CACHE_STORE);
+      if (!serverScope) {
+        store.clear();
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        return;
+      }
+      const req = store.index('serverScope').getAllKeys(serverScope);
+      req.onsuccess = () => {
+        const keys = (req.result as IDBValidKey[]) || [];
+        for (const key of keys) {
+          store.delete(key);
+        }
+      };
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch {
+    // ignore
+  } finally {
+    db?.close();
+  }
+}
+
 
